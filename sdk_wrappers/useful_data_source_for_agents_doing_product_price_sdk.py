@@ -1,425 +1,417 @@
+"""
+buywhere_singapore_sdk.py
+
+Thin HTTP wrapper for the BuyWhere Singapore Price Intelligence API.
+Exposes semantic product search with SGD-normalized prices, value-score
+ranking, and structured responses ready for direct LLM agent consumption.
+"""
+
+from __future__ import annotations
+
 import os
-import time
-from typing import Any, Optional
+from typing import Any
+
 import httpx
 
-DEFAULT_BASE_URL = "https://api.buywhere-sg.nexus.ai/v1"
-DEFAULT_TIMEOUT_SECONDS = 30.0
-DEFAULT_MAX_RETRIES = 3
-RETRY_BACKOFF_BASE = 0.5
+_DEFAULT_BASE_URL = "https://api.buywhere.sg/v1"
+_DEFAULT_TIMEOUT = 30.0
 
 
 class BuyWhereSGAuthError(Exception):
-    pass
+    """Raised when the API key is missing or rejected."""
 
 
-class BuyWhereSGValidationError(Exception):
-    pass
-
-
-class BuyWhereSGRateLimitError(Exception):
-    pass
+class BuyWhereSGValidationError(ValueError):
+    """Raised when input parameters fail pre-flight validation."""
 
 
 class BuyWhereSGAPIError(Exception):
-    def __init__(self, message: str, status_code: int, response_body: Any = None):
-        super().__init__(message)
+    """Raised when the API returns a non-2xx response."""
+
+    def __init__(self, status_code: int, detail: str) -> None:
         self.status_code = status_code
-        self.response_body = response_body
+        self.detail = detail
+        super().__init__(f"API error {status_code}: {detail}")
 
 
-def _validate_non_empty_string(value: Any, field_name: str) -> str:
-    if value is None:
-        raise BuyWhereSGValidationError(f"'{field_name}' must not be None")
-    if not isinstance(value, str):
-        raise BuyWhereSGValidationError(
-            f"'{field_name}' must be a string, got {type(value).__name__}"
-        )
-    stripped = value.strip()
-    if not stripped:
-        raise BuyWhereSGValidationError(f"'{field_name}' must not be an empty string")
-    return stripped
-
-
-def _validate_product_domain(domain: str) -> str:
-    allowed = {"electronics", "appliances", "computing"}
-    if domain not in allowed:
-        raise BuyWhereSGValidationError(
-            f"'product_domain' must be one of {sorted(allowed)}, got '{domain}'"
-        )
-    return domain
-
-
-def _validate_positive_int(value: Any, field_name: str, maximum: int = 100) -> int:
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise BuyWhereSGValidationError(
-            f"'{field_name}' must be an integer, got {type(value).__name__}"
-        )
-    if value < 1:
-        raise BuyWhereSGValidationError(f"'{field_name}' must be >= 1, got {value}")
-    if value > maximum:
-        raise BuyWhereSGValidationError(
-            f"'{field_name}' must be <= {maximum}, got {value}"
-        )
-    return value
+class BuyWhereSGRateLimitError(BuyWhereSGAPIError):
+    """Raised on HTTP 429 — caller should back off before retrying."""
 
 
 class Client:
     """
-    Thin HTTP wrapper over the BuyWhere Singapore price intelligence API.
+    BuyWhere Singapore Price Intelligence SDK.
 
-    All prices are denominated in SGD. Responses include price_dispersion_bits,
-    a Shannon-entropy measure over the vendor price distribution computed
-    server-side — use it to flag anomalous pricing without any additional parsing.
+    Per-call pricing model: each method maps to exactly one billable API call.
+    No logic is reimplemented client-side; value-score and causal ranking are
+    computed server-side and returned as auditable fields in every response.
 
-    Usage:
-        client = Client(api_key="sk-...")
-        result = client.search_products("sony wh-1000xm5")
-        result = client.get_product_prices("SKU-abc123")
-        result = client.compare_vendor_prices("SKU-abc123")
-        result = client.get_price_history("SKU-abc123", days=30)
-        result = client.detect_price_anomalies("electronics", threshold_bits=1.5)
+    Parameters
+    ----------
+    api_key:
+        Secret key issued by BuyWhere SG. Falls back to the
+        ``BUYWHERE_SG_API_KEY`` environment variable when omitted.
+    base_url:
+        Override the default API base URL (useful for staging environments).
+    timeout:
+        Per-request timeout in seconds (default: 30).
     """
 
     def __init__(
         self,
-        api_key: Optional[str] = None,
-        base_url: str = DEFAULT_BASE_URL,
-        timeout: float = DEFAULT_TIMEOUT_SECONDS,
-        max_retries: int = DEFAULT_MAX_RETRIES,
-    ):
+        api_key: str | None = None,
+        base_url: str = _DEFAULT_BASE_URL,
+        timeout: float = _DEFAULT_TIMEOUT,
+    ) -> None:
         resolved_key = api_key or os.environ.get("BUYWHERE_SG_API_KEY")
         if not resolved_key:
             raise BuyWhereSGAuthError(
-                "API key is required. Pass api_key= or set BUYWHERE_SG_API_KEY "
-                "environment variable."
+                "No API key provided. Pass api_key= or set the "
+                "BUYWHERE_SG_API_KEY environment variable."
             )
         if not isinstance(resolved_key, str) or not resolved_key.strip():
             raise BuyWhereSGAuthError(
-                "API key must be a non-empty string."
+                "api_key must be a non-empty string."
             )
+
         self._api_key = resolved_key.strip()
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
-        self._max_retries = max_retries
         self._http = httpx.Client(
             headers={
                 "Authorization": f"Bearer {self._api_key}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "X-Client": "buywhere-sg-python-sdk/1.0.0",
             },
             timeout=self._timeout,
         )
 
-    def _request(
-        self,
-        method: str,
-        path: str,
-        params: Optional[dict] = None,
-        json_body: Optional[dict] = None,
-    ) -> dict:
-        url = f"{self._base_url}{path}"
-        last_exc: Optional[Exception] = None
-        for attempt in range(self._max_retries):
-            try:
-                response = self._http.request(
-                    method, url, params=params, json=json_body
-                )
-            except httpx.TimeoutException as exc:
-                last_exc = exc
-                wait = RETRY_BACKOFF_BASE * (2 ** attempt)
-                time.sleep(wait)
-                continue
-            except httpx.RequestError as exc:
-                raise BuyWhereSGAPIError(
-                    f"Network error contacting BuyWhere SG API: {exc}",
-                    status_code=0,
-                ) from exc
+    # ------------------------------------------------------------------
+    # Primary interface — the method an agent calls directly
+    # ------------------------------------------------------------------
 
-            if response.status_code == 401:
-                raise BuyWhereSGAuthError(
-                    "Invalid or expired API key. Check your credentials."
-                )
-            if response.status_code == 422:
-                try:
-                    body = response.json()
-                except Exception:
-                    body = response.text
-                raise BuyWhereSGValidationError(
-                    f"Request validation failed: {body}"
-                )
-            if response.status_code == 429:
-                retry_after = response.headers.get("Retry-After", "unknown")
-                raise BuyWhereSGRateLimitError(
-                    f"Rate limit exceeded. Retry after {retry_after} seconds."
-                )
-            if response.status_code >= 500:
-                last_exc = BuyWhereSGAPIError(
-                    f"Server error {response.status_code}: {response.text[:200]}",
-                    status_code=response.status_code,
-                    response_body=response.text,
-                )
-                wait = RETRY_BACKOFF_BASE * (2 ** attempt)
-                time.sleep(wait)
-                continue
-            if response.status_code >= 400:
-                try:
-                    body = response.json()
-                except Exception:
-                    body = response.text
-                raise BuyWhereSGAPIError(
-                    f"Client error {response.status_code}: {body}",
-                    status_code=response.status_code,
-                    response_body=body,
-                )
-            try:
-                return response.json()
-            except Exception as exc:
-                raise BuyWhereSGAPIError(
-                    "API returned non-JSON response.",
-                    status_code=response.status_code,
-                    response_body=response.text,
-                ) from exc
-
-        if last_exc is not None:
-            raise BuyWhereSGAPIError(
-                f"Request failed after {self._max_retries} attempts: {last_exc}",
-                status_code=0,
-            ) from last_exc
-        raise BuyWhereSGAPIError(
-            f"Request failed after {self._max_retries} attempts.",
-            status_code=0,
-        )
-
-    def main_method(self, data: Any) -> dict:
+    def main_method(self, data: dict[str, Any]) -> dict[str, Any]:
         """
-        Unified entry point accepting a dict or string query.
+        Semantic product search over the BuyWhere Singapore catalogue.
 
-        - If data is a string: delegates to search_products(data).
-        - If data is a dict with key 'sku': delegates to get_product_prices(data['sku']).
-        - If data is a dict with key 'query': delegates to search_products(data['query']).
-        - All other keys in the dict are forwarded as optional parameters.
+        This is the primary entry point used by LLM agents. It accepts a
+        free-form query plus optional filters and returns a ranked list of
+        product offers with SGD-normalized prices and auditable value-scores.
 
-        Raises BuyWhereSGValidationError for None, wrong type, or missing keys.
+        ``data`` fields
+        ---------------
+        query : str (required)
+            Natural-language product query, e.g. "Sony WH-1000XM5 headphones".
+            Must be between 3 and 512 characters.
+        top_k : int (optional, default 10, range 1-50)
+            Maximum number of ranked results to return.
+        min_value_score : float (optional, range 0.0-1.0)
+            Filter out products whose value-score falls below this threshold.
+        category : str (optional)
+            Restrict search to a BuyWhere product category slug
+            (e.g. "electronics", "home-appliances").
+        include_vendor_detail : bool (optional, default False)
+            When True, each result embeds per-vendor breakdown with individual
+            prices, stock status, and intra-session variance penalties.
+
+        Returns
+        -------
+        dict with keys:
+            query_id        : str — unique identifier for this search call
+            query           : str — echo of the submitted query
+            results         : list[dict] — ranked product offers (see below)
+            metadata        : dict — token usage, latency_ms, call cost SGD
+
+        Each item in ``results`` contains:
+            product_id      : str
+            title           : str
+            best_price_sgd  : float
+            value_score     : float  (0.0 – 1.0, higher = better value)
+            entropy_bits    : float  (Shannon entropy of the vendor price dist.)
+            causal_rank     : int    (1 = best causal rank)
+            vendor_count    : int
+            vendors         : list[dict] | None  (present if include_vendor_detail)
+
+        Raises
+        ------
+        BuyWhereSGValidationError   — missing/invalid fields in ``data``
+        BuyWhereSGAuthError         — API key rejected (HTTP 401/403)
+        BuyWhereSGRateLimitError    — request quota exceeded (HTTP 429)
+        BuyWhereSGAPIError          — any other non-2xx API response
         """
         if data is None:
             raise BuyWhereSGValidationError(
-                "'data' must not be None. Pass a search query string or a dict "
-                "with 'query' or 'sku' key."
+                "'data' must be a dict, got None."
             )
-        if isinstance(data, str):
-            return self.search_products(data)
-        if isinstance(data, dict):
-            if "sku" in data:
-                sku = data["sku"]
-                limit = data.get("limit", 20)
-                return self.get_product_prices(sku, limit=limit)
-            if "query" in data:
-                query = data["query"]
-                product_domain = data.get("product_domain")
-                limit = data.get("limit", 20)
-                return self.search_products(
-                    query, product_domain=product_domain, limit=limit
-                )
+        if not isinstance(data, dict):
             raise BuyWhereSGValidationError(
-                "'data' dict must contain 'query' (product search string) or "
-                "'sku' (product identifier). Got keys: "
-                f"{list(data.keys())}"
+                f"'data' must be a dict, got {type(data).__name__}."
             )
-        raise BuyWhereSGValidationError(
-            f"'data' must be a str or dict, got {type(data).__name__}"
-        )
 
-    def search_products(
-        self,
-        query: str,
-        product_domain: Optional[str] = None,
-        limit: int = 20,
-    ) -> dict:
-        """
-        Full-text search over the BuyWhere SG catalogue.
-
-        Returns matched products with current best SGD price, vendor count,
-        and availability_mode ('online'|'physical'|'both').
-
-        Args:
-            query: Product search string, e.g. "sony wh-1000xm5" (1-200 chars).
-            product_domain: Optional domain filter — 'electronics', 'appliances',
-                or 'computing'. Omit to search across all domains.
-            limit: Number of results to return (1-100). Default 20.
-
-        Returns:
-            dict with keys: products (list), total_count (int), query_time_ms (float).
-        """
-        validated_query = _validate_non_empty_string(query, "query")
-        if len(validated_query) > 200:
+        query = data.get("query")
+        if query is None:
             raise BuyWhereSGValidationError(
-                f"'query' must not exceed 200 characters, got {len(validated_query)}"
+                "Missing required field 'query' in data."
             )
-        validated_limit = _validate_positive_int(limit, "limit", maximum=100)
-        params: dict = {"q": validated_query, "limit": validated_limit}
-        if product_domain is not None:
-            params["domain"] = _validate_product_domain(product_domain)
-        return self._request("GET", "/products/search", params=params)
-
-    def get_product_prices(
-        self,
-        sku: str,
-        limit: int = 20,
-    ) -> dict:
-        """
-        Retrieve current vendor prices for a specific product SKU in SGD.
-
-        Response includes price_dispersion_bits (Shannon entropy over vendor
-        price distribution) — values above 1.5 bits typically indicate a
-        pricing anomaly worth surfacing to the end user.
-
-        Args:
-            sku: Product SKU identifier as returned by search_products (1-100 chars).
-            limit: Max number of vendor price listings to return (1-100). Default 20.
-
-        Returns:
-            dict with keys: sku, product_name, vendors (list of vendor+price+
-            availability), price_dispersion_bits (float), snapshot_age_seconds (int).
-        """
-        validated_sku = _validate_non_empty_string(sku, "sku")
-        if len(validated_sku) > 100:
+        if not isinstance(query, str):
             raise BuyWhereSGValidationError(
-                f"'sku' must not exceed 100 characters, got {len(validated_sku)}"
+                f"'query' must be a str, got {type(query).__name__}."
             )
-        validated_limit = _validate_positive_int(limit, "limit", maximum=100)
-        return self._request(
-            "GET",
-            f"/products/{validated_sku}/prices",
-            params={"limit": validated_limit},
-        )
-
-    def compare_vendor_prices(
-        self,
-        sku: str,
-        availability_mode: Optional[str] = None,
-    ) -> dict:
-        """
-        Side-by-side vendor comparison for a SKU, ranked by SGD price ascending.
-
-        Filters by availability_mode to restrict results to physical stores,
-        online-only, or both. Includes price_dispersion_bits across the filtered
-        vendor set so agents can detect whether filtering changes anomaly risk.
-
-        Use this when the agent needs to recommend a specific vendor, not just
-        a price range. Do NOT use this as a substitute for search_products
-        when the SKU is unknown.
-
-        Args:
-            sku: Product SKU identifier (1-100 chars).
-            availability_mode: Optional filter — 'online', 'physical', or 'both'.
-                Omit to include all vendors regardless of channel.
-
-        Returns:
-            dict with keys: sku, ranked_vendors (list), cheapest_vendor,
-            price_spread_sgd (float), price_dispersion_bits (float).
-        """
-        validated_sku = _validate_non_empty_string(sku, "sku")
-        if len(validated_sku) > 100:
+        query = query.strip()
+        if len(query) < 3:
             raise BuyWhereSGValidationError(
-                f"'sku' must not exceed 100 characters, got {len(validated_sku)}"
+                "'query' must be at least 3 characters after stripping whitespace."
             )
-        params: dict = {}
-        if availability_mode is not None:
-            allowed_modes = {"online", "physical", "both"}
-            if availability_mode not in allowed_modes:
+        if len(query) > 512:
+            raise BuyWhereSGValidationError(
+                "'query' must not exceed 512 characters."
+            )
+
+        top_k = data.get("top_k", 10)
+        if not isinstance(top_k, int) or isinstance(top_k, bool):
+            raise BuyWhereSGValidationError(
+                f"'top_k' must be an int, got {type(top_k).__name__}."
+            )
+        if not (1 <= top_k <= 50):
+            raise BuyWhereSGValidationError(
+                f"'top_k' must be between 1 and 50, got {top_k}."
+            )
+
+        min_value_score = data.get("min_value_score")
+        if min_value_score is not None:
+            if not isinstance(min_value_score, (int, float)) or isinstance(
+                min_value_score, bool
+            ):
                 raise BuyWhereSGValidationError(
-                    f"'availability_mode' must be one of {sorted(allowed_modes)}, "
-                    f"got '{availability_mode}'"
+                    f"'min_value_score' must be a float, got {type(min_value_score).__name__}."
                 )
-            params["availability_mode"] = availability_mode
-        return self._request(
-            "GET", f"/products/{validated_sku}/compare", params=params or None
-        )
+            if not (0.0 <= float(min_value_score) <= 1.0):
+                raise BuyWhereSGValidationError(
+                    f"'min_value_score' must be in [0.0, 1.0], got {min_value_score}."
+                )
+
+        category = data.get("category")
+        if category is not None and not isinstance(category, str):
+            raise BuyWhereSGValidationError(
+                f"'category' must be a str, got {type(category).__name__}."
+            )
+
+        include_vendor_detail = data.get("include_vendor_detail", False)
+        if not isinstance(include_vendor_detail, bool):
+            raise BuyWhereSGValidationError(
+                f"'include_vendor_detail' must be a bool, got "
+                f"{type(include_vendor_detail).__name__}."
+            )
+
+        payload: dict[str, Any] = {
+            "query": query,
+            "top_k": top_k,
+            "include_vendor_detail": include_vendor_detail,
+        }
+        if min_value_score is not None:
+            payload["min_value_score"] = float(min_value_score)
+        if category is not None:
+            payload["category"] = category.strip()
+
+        return self._post("/search/semantic", payload)
+
+    # ------------------------------------------------------------------
+    # Additional public methods (surface-minimal: 4 total public methods)
+    # ------------------------------------------------------------------
+
+    def get_product_value_score(self, product_id: str) -> dict[str, Any]:
+        """
+        Retrieve the current value-score and vendor price distribution for a
+        single product by its BuyWhere product ID.
+
+        Use this when an agent already has a product_id from a prior
+        ``main_method`` call and needs a fresh score without re-running a
+        full semantic search.
+
+        Do NOT use this as the first call when only a product name is known —
+        use ``main_method`` instead.
+
+        Parameters
+        ----------
+        product_id : str
+            BuyWhere catalogue product identifier (non-empty string, max 64 chars).
+
+        Returns
+        -------
+        dict with keys:
+            product_id      : str
+            title           : str
+            value_score     : float
+            entropy_bits    : float
+            causal_rank     : int
+            best_price_sgd  : float
+            vendor_prices   : list[dict]  (vendor_name, price_sgd, variance_penalty)
+            refreshed_at    : str  (ISO-8601 UTC timestamp)
+        """
+        if not product_id:
+            raise BuyWhereSGValidationError(
+                "'product_id' must be a non-empty string."
+            )
+        if not isinstance(product_id, str):
+            raise BuyWhereSGValidationError(
+                f"'product_id' must be a str, got {type(product_id).__name__}."
+            )
+        pid = product_id.strip()
+        if not pid:
+            raise BuyWhereSGValidationError(
+                "'product_id' must not be blank after stripping whitespace."
+            )
+        if len(pid) > 64:
+            raise BuyWhereSGValidationError(
+                "'product_id' must not exceed 64 characters."
+            )
+
+        return self._get(f"/products/{pid}/value-score")
+
+    def list_categories(self) -> dict[str, Any]:
+        """
+        Return all available BuyWhere Singapore product category slugs and
+        their display names.
+
+        Use this to populate the optional ``category`` field in ``main_method``
+        with a valid slug. Do NOT use this on every search call — cache the
+        result; categories change infrequently (< once per day).
+
+        Returns
+        -------
+        dict with keys:
+            categories : list[dict]  (slug: str, display_name: str, product_count: int)
+            total      : int
+        """
+        return self._get("/categories")
 
     def get_price_history(
         self,
-        sku: str,
+        product_id: str,
         days: int = 30,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """
-        Time-series of SGD price observations for a SKU across all vendors.
+        Retrieve the SGD price history for a single product across all tracked
+        vendors over the specified lookback window.
 
-        Data is sourced from TimescaleDB and covers up to 90 days of history.
-        Each data point includes vendor_id, price_sgd, and recorded_at (ISO-8601).
+        Use this when an agent needs to reason about price trend or seasonality,
+        not just the current best price. The response includes the per-day
+        entropy series that feeds the causal ranking model server-side.
 
-        Use this to surface price trends or detect if current price is
-        above/below the rolling average. Do NOT use this for real-time
-        availability — use get_product_prices instead.
+        Do NOT use this as a substitute for ``main_method`` — it requires a
+        known product_id and does not perform semantic matching.
 
-        Args:
-            sku: Product SKU identifier (1-100 chars).
-            days: Number of historical days to retrieve (1-90). Default 30.
+        Parameters
+        ----------
+        product_id : str
+            BuyWhere catalogue product identifier (non-empty, max 64 chars).
+        days : int
+            Lookback window in calendar days (1-90, default 30).
 
-        Returns:
-            dict with keys: sku, history (list of price points), period_days (int),
-            min_price_sgd (float), max_price_sgd (float), mean_price_sgd (float).
+        Returns
+        -------
+        dict with keys:
+            product_id      : str
+            title           : str
+            history         : list[dict]  (date, min_price_sgd, max_price_sgd,
+                                           mean_price_sgd, entropy_bits, vendor_count)
+            currency        : "SGD"
         """
-        validated_sku = _validate_non_empty_string(sku, "sku")
-        if len(validated_sku) > 100:
+        if not product_id:
             raise BuyWhereSGValidationError(
-                f"'sku' must not exceed 100 characters, got {len(validated_sku)}"
+                "'product_id' must be a non-empty string."
             )
-        validated_days = _validate_positive_int(days, "days", maximum=90)
-        return self._request(
-            "GET",
-            f"/products/{validated_sku}/price-history",
-            params={"days": validated_days},
-        )
+        if not isinstance(product_id, str):
+            raise BuyWhereSGValidationError(
+                f"'product_id' must be a str, got {type(product_id).__name__}."
+            )
+        pid = product_id.strip()
+        if not pid:
+            raise BuyWhereSGValidationError(
+                "'product_id' must not be blank after stripping whitespace."
+            )
+        if len(pid) > 64:
+            raise BuyWhereSGValidationError(
+                "'product_id' must not exceed 64 characters."
+            )
 
-    def detect_price_anomalies(
+        if not isinstance(days, int) or isinstance(days, bool):
+            raise BuyWhereSGValidationError(
+                f"'days' must be an int, got {type(days).__name__}."
+            )
+        if not (1 <= days <= 90):
+            raise BuyWhereSGValidationError(
+                f"'days' must be between 1 and 90, got {days}."
+            )
+
+        return self._get(f"/products/{pid}/price-history", params={"days": days})
+
+    # ------------------------------------------------------------------
+    # Internal HTTP helpers
+    # ------------------------------------------------------------------
+
+    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        url = f"{self._base_url}{path}"
+        try:
+            response = self._http.post(url, json=payload)
+        except httpx.TimeoutException as exc:
+            raise BuyWhereSGAPIError(
+                408,
+                f"Request to {url} timed out after {self._timeout}s: {exc}",
+            ) from exc
+        except httpx.RequestError as exc:
+            raise BuyWhereSGAPIError(
+                0,
+                f"Network error reaching {url}: {exc}",
+            ) from exc
+        return self._parse_response(response)
+
+    def _get(
         self,
-        product_domain: str,
-        threshold_bits: float = 1.5,
-        limit: int = 20,
-    ) -> dict:
-        """
-        Return products in a domain where price_dispersion_bits exceeds threshold.
+        path: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        url = f"{self._base_url}{path}"
+        try:
+            response = self._http.get(url, params=params)
+        except httpx.TimeoutException as exc:
+            raise BuyWhereSGAPIError(
+                408,
+                f"Request to {url} timed out after {self._timeout}s: {exc}",
+            ) from exc
+        except httpx.RequestError as exc:
+            raise BuyWhereSGAPIError(
+                0,
+                f"Network error reaching {url}: {exc}",
+            ) from exc
+        return self._parse_response(response)
 
-        High dispersion (bits > 1.5) indicates vendors have materially divergent
-        prices — useful for surfacing arbitrage opportunities or data quality issues.
-        Computed server-side via Shannon entropy over the vendor price distribution
-        at query time; no client-side parsing required.
-
-        Use this when the agent is doing market-wide price intelligence sweeps.
-        Do NOT use this for single-product price lookup — use get_product_prices.
-
-        Args:
-            product_domain: Domain to scan — 'electronics', 'appliances', or 'computing'.
-            threshold_bits: Minimum entropy threshold in bits (0.0-4.0). Default 1.5.
-            limit: Max anomalies to return (1-100). Default 20.
-
-        Returns:
-            dict with keys: domain, anomalies (list of sku+name+price_dispersion_bits),
-            threshold_bits (float), scanned_product_count (int).
-        """
-        validated_domain = _validate_product_domain(product_domain)
-        if not isinstance(threshold_bits, (int, float)) or isinstance(
-            threshold_bits, bool
-        ):
-            raise BuyWhereSGValidationError(
-                f"'threshold_bits' must be a float, got {type(threshold_bits).__name__}"
+    def _parse_response(self, response: httpx.Response) -> dict[str, Any]:
+        if response.status_code == 401 or response.status_code == 403:
+            raise BuyWhereSGAuthError(
+                f"Authentication failed (HTTP {response.status_code}). "
+                "Verify your API key is correct and active."
             )
-        if threshold_bits < 0.0 or threshold_bits > 4.0:
-            raise BuyWhereSGValidationError(
-                f"'threshold_bits' must be between 0.0 and 4.0, got {threshold_bits}"
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After", "unknown")
+            raise BuyWhereSGRateLimitError(
+                429,
+                f"Rate limit exceeded. Retry after {retry_after} seconds.",
             )
-        validated_limit = _validate_positive_int(limit, "limit", maximum=100)
-        return self._request(
-            "GET",
-            "/prices/anomalies",
-            params={
-                "domain": validated_domain,
-                "threshold_bits": threshold_bits,
-                "limit": validated_limit,
-            },
-        )
+        if response.status_code >= 400:
+            try:
+                detail = response.json().get("detail", response.text)
+            except Exception:
+                detail = response.text
+            raise BuyWhereSGAPIError(response.status_code, detail)
+        try:
+            return response.json()
+        except Exception as exc:
+            raise BuyWhereSGAPIError(
+                response.status_code,
+                f"Failed to decode JSON response: {exc}. "
+                f"Raw body (first 200 chars): {response.text[:200]}",
+            ) from exc
 
     def close(self) -> None:
         """Release the underlying HTTP connection pool."""
@@ -428,5 +420,5 @@ class Client:
     def __enter__(self) -> "Client":
         return self
 
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+    def __exit__(self, *_: Any) -> None:
         self.close()
