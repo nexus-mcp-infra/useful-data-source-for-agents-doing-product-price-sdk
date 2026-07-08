@@ -1,207 +1,179 @@
 import numpy as np
 from scipy.optimize import minimize_scalar
-from scipy.stats import norm
-from dataclasses import dataclass
+from scipy.stats import entropy as scipy_entropy
+from dataclasses import dataclass, field
 from typing import NamedTuple
 
-# BuyWhere SGD Price API — elasticidad precio-demanda para developers
-# Rango de disposicion a pagar: $0.001 (hobbyist) a $0.05 (enterprise) por operacion
-# Volumen: 1K a 10M ops/mes por cliente
 
-WTP_MIN = 0.001
-WTP_MAX = 0.05
-VOL_MIN = 1_000
-VOL_MAX = 10_000_000
-
-# Parametros de mercado calibrados para developer tools con flywheel de datos
-# alpha: demanda base (operaciones/mes agregadas en mercado SG/SE Asia dev)
-# beta: sensibilidad precio — developers son elasticos en tier bajo, inelasticos en enterprise
-MARKET_ALPHA = 2_500_000.0
-MARKET_BETA = 38.0
-FREEMIUM_THRESHOLD_OPS = 5_000  # ops/mes gratis antes de cobrar
+# Parametros de mercado calibrados para developer tools SEA / Singapore e-commerce agents
+P_MIN = 0.001   # USD por operacion (lower bound disposicion a pagar)
+P_MAX = 0.050   # USD por operacion (upper bound disposicion a pagar)
+Q_BASE = 1_000_000  # operaciones/mes referencia (punto medio geometrico 1K-10M)
+PRICE_REF = 0.010   # precio de referencia para elasticidad (centil 50 del rango)
 
 
 @dataclass
-class DemandPoint:
-    price: float
-    quantity: float
-    elasticity: float
-    revenue: float
-    price_dispersion_signal: float  # bits de entropia como proxy de valor percibido
+class DemandParams:
+    alpha: float        # escala de demanda (intercepto log-log)
+    beta: float         # elasticidad precio propia (negativa)
+    q_freemium_cap: float  # volumen maximo en tier free antes de conversion
+    conversion_rate: float # fraccion de usuarios free que pagan al tocar el cap
 
 
 class ScenarioResult(NamedTuple):
     name: str
-    clients: int
-    ops_per_client_monthly: float
-    price_per_op: float
-    monthly_revenue: float
-    elasticity_at_price: float
-    freemium_conversion_rate: float
+    price_optimal: float
+    q_at_optimal: float
+    revenue_monthly: float
+    elasticity_at_optimal: float
+    freemium_equilibrium_price: float
 
 
-def buywhere_demand(price: float, alpha: float = MARKET_ALPHA, beta: float = MARKET_BETA) -> float:
-    """
-    Q(P) = alpha * exp(-beta * P)
-    Forma exponencial: captura la caida rapida de adopcion al subir precio en mercado dev.
-    Con P=0.001 -> Q~2.4M ops; P=0.05 -> Q~5.1K ops — coherente con vol esperado.
-    """
+# Demanda tipo power-law: Q(P) = alpha * P^beta
+# Justificacion: developer tools siguen adopcion con sensibilidad al precio log-lineal
+def buywhere_demand(price: float, params: DemandParams) -> float:
     if price <= 0:
-        raise ValueError(f"price debe ser positivo, recibido: {price}")
-    return alpha * np.exp(-beta * price)
+        raise ValueError(f"price debe ser > 0, recibido: {price}")
+    return params.alpha * (price ** params.beta)
 
 
-def price_elasticity(price: float, alpha: float = MARKET_ALPHA, beta: float = MARKET_BETA) -> float:
-    """
-    epsilon = (dQ/dP) * (P/Q)
-    Para Q = alpha*exp(-beta*P): dQ/dP = -beta*Q => epsilon = -beta*P
-    """
-    if price <= 0:
-        raise ValueError(f"price debe ser positivo, recibido: {price}")
-    return -beta * price  # elasticidad constante en funcion del precio, no de Q
+# Elasticidad precio-demanda puntual: epsilon = beta (constante en power-law)
+# Para power-law dQ/dP = alpha * beta * P^(beta-1), entonces epsilon = beta exacto
+def price_elasticity(price: float, params: DemandParams) -> float:
+    # epsilon = (dQ/dP) * (P / Q) = (alpha * beta * P^(beta-1)) * (P / (alpha * P^beta)) = beta
+    return params.beta  # independiente del precio en modelo log-log
 
 
-def revenue(price: float) -> float:
-    # R(P) = P * Q(P); maximizar sobre P en [WTP_MIN, WTP_MAX]
-    return price * buywhere_demand(price)
+def revenue(price: float, params: DemandParams) -> float:
+    return price * buywhere_demand(price, params)
 
 
-def optimal_price_buywhere() -> tuple[float, float, float]:
-    """
-    max R(P) = P * alpha * exp(-beta*P)
-    Optimo analitico: P* = 1/beta (de dR/dP=0)
-    Restringido al rango de disposicion a pagar del mercado dev SG.
-    """
-    p_star_unconstrained = 1.0 / MARKET_BETA  # ~0.0263 USD/op
-    p_star = float(np.clip(p_star_unconstrained, WTP_MIN, WTP_MAX))
-    q_star = buywhere_demand(p_star)
-    r_star = p_star * q_star
-    return p_star, q_star, r_star
+def optimal_price(params: DemandParams) -> tuple[float, float, float]:
+    # Maximizar R(P) = P * alpha * P^beta = alpha * P^(1+beta)
+    # Condicion analitica: dR/dP = alpha*(1+beta)*P^beta = 0 solo si beta = -1 (unit elastic)
+    # Para beta != -1, el maximo en el dominio [P_MIN, P_MAX] se halla numericamente
+    result = minimize_scalar(
+        lambda p: -revenue(p, params),
+        bounds=(P_MIN, P_MAX),
+        method="bounded"
+    )
+    p_opt = result.x
+    q_opt = buywhere_demand(p_opt, params)
+    r_opt = p_opt * q_opt
+    return p_opt, q_opt, r_opt
 
 
-def shannon_entropy_price_dispersion(vendor_prices: list[float]) -> float:
-    """
-    Entropia de Shannon sobre distribucion de precios multi-vendor — diferenciador analitico.
-    H = -sum(p_i * log2(p_i)) donde p_i es peso normalizado de precio de vendor i.
-    Expuesto como price_dispersion_bits en cada respuesta de /prices.
-    """
-    if not vendor_prices or len(vendor_prices) < 2:
-        return 0.0
-    arr = np.array(vendor_prices, dtype=float)
-    if arr.min() <= 0:
-        raise ValueError("precios de vendor deben ser positivos para calcular entropia")
-    weights = arr / arr.sum()
-    # Evitar log(0) con clip
-    weights = np.clip(weights, 1e-12, 1.0)
-    return float(-np.sum(weights * np.log2(weights)))
+# Punto de equilibrio freemium->paid: precio donde revenue(paid tier) >= costo de oportunidad free
+# Modelo: usuario free genera q_freemium_cap ops/mes; convierte si precio <= valor_marginal
+# valor_marginal = revenue_por_op_libre estimado como P_MIN * (1 + margen_info)
+def freemium_equilibrium(params: DemandParams, info_margin: float = 0.8) -> float:
+    # info_margin refleja la prima del value-score (entropia de Shannon) sobre precio minimo puro
+    # Un value-score auditable justifica precio mayor que el scraper de precio-minimo
+    marginal_value = P_MIN * (1.0 + info_margin)
+    # Precio de equilibrio: punto donde conversion_rate * Q(P) * P = Q_free * P_MIN
+    # Despejando P: P = (Q_free * P_MIN) / (conversion_rate * alpha * P^beta) -> iteracion
+    from scipy.optimize import brentq
+    def equilibrium_condition(p: float) -> float:
+        paid_revenue = params.conversion_rate * buywhere_demand(p, params) * p
+        free_opportunity_cost = params.q_freemium_cap * P_MIN
+        return paid_revenue - free_opportunity_cost
+
+    try:
+        p_eq = brentq(equilibrium_condition, P_MIN, P_MAX, xtol=1e-7)
+    except ValueError:
+        # No hay cruce en el rango: retornar bound mas cercano
+        p_eq = P_MIN if equilibrium_condition(P_MIN) > 0 else P_MAX
+    return p_eq
 
 
-def freemium_to_paid_conversion(price: float, free_ops: int = FREEMIUM_THRESHOLD_OPS) -> float:
-    """
-    Tasa de conversion freemium->paid modelada como CDF normal sobre log(price).
-    Calibrada: 50% conversion a P=0.005 (precio psicologico dev), sigma=0.8 en log-space.
-    Developers en SG/SE Asia convierten bien bajo $0.01/op para herramientas de agente.
-    """
-    if price <= 0:
-        raise ValueError(f"price debe ser positivo para calcular conversion, recibido: {price}")
-    mu_log = np.log(0.005)   # precio de conversion media: $0.005/op
-    sigma_log = 0.8
-    # P(convert) decrece al subir precio — 1 - CDF(log(price))
-    return float(1.0 - norm.cdf(np.log(price), loc=mu_log, scale=sigma_log))
+# Shannon entropy sobre distribucion de precios entre vendors (mismo calculo que value-score)
+# p_i = precio_vendor_i / sum(precios); H alta -> alta dispersion -> mayor valor informacional
+def vendor_price_entropy(vendor_prices: list[float]) -> float:
+    if len(vendor_prices) < 2:
+        raise ValueError("Se requieren al menos 2 vendors para calcular entropia de precios")
+    prices = np.array(vendor_prices, dtype=float)
+    if np.any(prices <= 0):
+        raise ValueError("Todos los precios deben ser positivos")
+    probs = prices / prices.sum()   # fraccion relativa al total (no al rango, consistente con spec)
+    return float(scipy_entropy(probs, base=2))  # bits de incertidumbre entre vendors
 
 
-def simulate_adoption_scenarios() -> list[ScenarioResult]:
-    """
-    EXACTAMENTE 3 escenarios: hobbyist, growth-stage startup, enterprise SG/SE Asia.
-    Cada uno refleja un segmento real del mercado de developer tools con agentes LLM.
-    """
-    scenarios_config = [
-        # (nombre, n_clientes, ops_por_cliente/mes, precio/op)
-        ("hobbyist_agent_builder", 800,    3_500,     0.002),   # bajo vol, sensible al precio
-        ("growth_startup_sg",     120,    85_000,     0.008),   # balance elasticidad/valor
-        ("enterprise_retailer",    15, 1_200_000,     0.025),   # inelastico, paga por frescura
-    ]
+# Escenario 1: Early adopters (alto volumen, baja sensibilidad al precio)
+# Beta moderado: developers que ya tienen pain point definido y presupuesto
+scenario_early_adopter = DemandParams(
+    alpha=Q_BASE * (PRICE_REF ** 1.2),  # calibrado para Q=Q_BASE en P=PRICE_REF
+    beta=-1.2,
+    q_freemium_cap=50_000,
+    conversion_rate=0.18
+)
 
+# Escenario 2: Mercado masivo SEA (alta sensibilidad, adopcion gradual)
+# Beta alto: integradores price-sensitive en mercados emergentes
+scenario_sea_mass_market = DemandParams(
+    alpha=Q_BASE * (PRICE_REF ** 2.1),
+    beta=-2.1,
+    q_freemium_cap=200_000,
+    conversion_rate=0.06
+)
+
+# Escenario 3: Enterprise agents (bajo volumen, muy baja elasticidad, SLA-driven)
+# Beta bajo: equipos de producto que valoran auditabilidad del value-score sobre precio
+scenario_enterprise_agents = DemandParams(
+    alpha=Q_BASE * (PRICE_REF ** 0.7),
+    beta=-0.7,
+    q_freemium_cap=10_000,
+    conversion_rate=0.35
+)
+
+SCENARIOS: dict[str, DemandParams] = {
+    "early_adopter_sea_devtools": scenario_early_adopter,
+    "sea_mass_market_integrators": scenario_sea_mass_market,
+    "enterprise_llm_agents": scenario_enterprise_agents,
+}
+
+
+def simulate_all_scenarios() -> list[ScenarioResult]:
     results = []
-    for name, clients, ops_per_client, price in scenarios_config:
-        total_ops_market = clients * ops_per_client
-        eps = price_elasticity(price)
-        conv_rate = freemium_to_paid_conversion(price)
-        paying_clients = clients * conv_rate
-        monthly_rev = paying_clients * ops_per_client * price
-
-        # Simular dispersion de precios BuyWhere con 4 vendors SG (Lazada, Shopee, Courts, Harvey Norman)
-        # Precios de producto de referencia escalados por segmento para entropia realista
-        base_sgd = 299.0 * (1 + ops_per_client / VOL_MAX)
-        vendor_prices_sgd = [
-            base_sgd * np.random.uniform(0.92, 1.0),
-            base_sgd * np.random.uniform(0.95, 1.08),
-            base_sgd * np.random.uniform(0.88, 1.05),
-            base_sgd * np.random.uniform(0.97, 1.12),
-        ]
-        dispersion_bits = shannon_entropy_price_dispersion(vendor_prices_sgd)
-
+    for name, params in SCENARIOS.items():
+        p_opt, q_opt, r_opt = optimal_price(params)
+        eps = price_elasticity(p_opt, params)
+        p_eq = freemium_equilibrium(params)
         results.append(ScenarioResult(
             name=name,
-            clients=clients,
-            ops_per_client_monthly=ops_per_client,
-            price_per_op=price,
-            monthly_revenue=monthly_rev,
-            elasticity_at_price=eps,
-            freemium_conversion_rate=conv_rate,
+            price_optimal=round(p_opt, 6),
+            q_at_optimal=round(q_opt, 0),
+            revenue_monthly=round(r_opt, 2),
+            elasticity_at_optimal=round(eps, 3),
+            freemium_equilibrium_price=round(p_eq, 6),
         ))
     return results
 
 
-def freemium_equilibrium_price() -> dict[str, float]:
-    """
-    Precio de equilibrio freemium->paid: donde R(P_paid) = R(P_free=0) + valor_marginal_datos.
-    Valor marginal = diferencial de entropia entre snapshot fresco vs stale * lambda_freshness.
-    """
-    # Estimacion de valor de freshness: TTL=300s, re-scrape dispara cuando stale
-    # Cada re-scrape captura ~0.3 bits adicionales de señal de precio (flywheel data)
-    lambda_freshness_usd_per_bit = 0.003  # $0.003 por bit de reduccion de incertidumbre
-    delta_entropy_bits = 0.3
-    marginal_data_value = lambda_freshness_usd_per_bit * delta_entropy_bits
-
-    # Precio de equilibrio: P_eq donde conversion(P_eq) * ops_medio = breakeven_ops
-    breakeven_ops = FREEMIUM_THRESHOLD_OPS
-    p_star, _, _ = optimal_price_buywhere()
-
-    # P_equilibrio: minimo precio donde R_paid supera costo de oportunidad del tier free
-    # Resuelto numericamente sobre rango dev-tool
-    prices = np.linspace(WTP_MIN, WTP_MAX, 10_000)
-    revenues = np.array([p * freemium_to_paid_conversion(p) * breakeven_ops for p in prices])
-    freemium_baseline = marginal_data_value * breakeven_ops
-    above_baseline = revenues > freemium_baseline
-    p_equilibrium = float(prices[above_baseline][0]) if above_baseline.any() else WTP_MIN
-
-    return {
-        "freemium_equilibrium_price_usd": round(p_equilibrium, 5),
-        "marginal_data_value_usd": round(marginal_data_value, 6),
-        "optimal_unconstrained_price_usd": round(1.0 / MARKET_BETA, 5),
-        "optimal_constrained_price_usd": round(p_star, 5),
-    }
+def validate_model_consistency(results: list[ScenarioResult]) -> None:
+    for r in results:
+        assert P_MIN <= r.price_optimal <= P_MAX, (
+            f"Precio optimo {r.price_optimal} fuera del rango de disposicion a pagar [{P_MIN}, {P_MAX}]"
+        )
+        assert r.q_at_optimal > 0, f"Demanda en optimo debe ser positiva para {r.name}"
+        assert r.revenue_monthly > 0, f"Revenue mensual debe ser positivo para {r.name}"
+        assert r.elasticity_at_optimal < 0, f"Elasticidad debe ser negativa (ley de demanda) para {r.name}"
 
 
 if __name__ == "__main__":
-    np.random.seed(42)
+    results = simulate_all_scenarios()
+    validate_model_consistency(results)
 
-    p_opt, q_opt, r_opt = optimal_price_buywhere()
-    eps_opt = price_elasticity(p_opt)
+    # Ejemplo de calculo de entropia con precios tipicos de vendors en BuyWhere Singapore
+    example_vendor_prices_sgd = [45.90, 52.00, 48.50, 61.00, 47.20]
+    h = vendor_price_entropy(example_vendor_prices_sgd)
 
-    print(f"Precio optimo: ${p_opt:.5f}/op | Q: {q_opt:,.0f} ops | Revenue: ${r_opt:,.2f}/mes")
-    print(f"Elasticidad en P*: {eps_opt:.4f} (|eps|=1 confirma maximo de revenue)")
-
-    print("\n--- Escenarios de adopcion ---")
-    for s in simulate_adoption_scenarios():
+    for r in results:
         print(
-            f"{s.name}: {s.clients} clientes | ${s.price_per_op}/op | "
-            f"conv={s.freemium_conversion_rate:.1%} | rev=${s.monthly_revenue:,.0f}/mes | "
-            f"eps={s.elasticity_at_price:.3f}"
+            f"scenario={r.name} | "
+            f"P_opt=${r.price_optimal:.5f} | "
+            f"Q_opt={r.q_at_optimal:.0f} ops/month | "
+            f"R_monthly=${r.revenue_monthly:.2f} | "
+            f"epsilon={r.elasticity_at_optimal:.3f} | "
+            f"freemium_eq_price=${r.freemium_equilibrium_price:.5f}"
         )
-
-    print("\n--- Equilibrio freemium->paid ---")
-    eq = freemium_equilibrium_price()
-    for k, v in eq.items():
-        print(f"  {k}: {v}")
+    print(f"vendor_price_entropy_example={h:.4f} bits (5 SGD vendors)")
