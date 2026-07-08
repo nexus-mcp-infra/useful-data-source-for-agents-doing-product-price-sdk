@@ -1,1060 +1,513 @@
-"""
-buywhere_sg_price_api.py
-
-FastAPI core for BuyWhere Singapore price intelligence.
-Exposes 5 public endpoints with unified schema, multi-vendor comparison,
-price history in SGD, availability metadata, and Shannon entropy-based
-price dispersion analytics computed natively.
-"""
-
-from __future__ import annotations
-
-import asyncio
-import hashlib
-import json
-import logging
+from fastapi import FastAPI, HTTPException, Security, Depends
+from fastapi.security.api_key import APIKeyHeader
+from pydantic import BaseModel, Field, field_validator
+from typing import Optional
+import httpx
+import numpy as np
+from scipy.stats import entropy as scipy_entropy
 import os
 import time
-from contextlib import asynccontextmanager, AsyncExitStack as _NexusMcpExitStack
-from datetime import datetime, timedelta, timezone
-from typing import Annotated, Any, Literal
+import hashlib
+import logging
 
-import numpy as np
-import redis.asyncio as aioredis
-import asyncpg
-import httpx
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator, model_validator
-from scipy import stats
-from mcp.server.fastmcp import FastMCP as _NexusFastMCP
-
-logger = logging.getLogger("buywhere_sg_api")
 logging.basicConfig(level=logging.INFO)
-
-# ---------------------------------------------------------------------------
-# Configuration (env-driven, with sensible defaults for local dev)
-# ---------------------------------------------------------------------------
-
-DATABASE_URL: str = os.getenv(
-    "DATABASE_URL",
-    "postgresql://postgres:postgres@localhost:5432/buywhere_sg",
-)
-REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-
-TTL_VENDOR_FRESHNESS: int = int(os.getenv("TTL_VENDOR_FRESHNESS", "900"))
-TTL_CACHE_SECONDS: int = int(os.getenv("TTL_CACHE_SECONDS", "120"))
-SCRAPER_CONCURRENCY: int = int(os.getenv("SCRAPER_CONCURRENCY", "6"))
-API_KEY_HEADER: str = "X-BuyWhere-Key"
-
-KNOWN_VENDORS: dict[str, str] = {
-    "lazada_sg":     "https://www.lazada.sg",
-    "shopee_sg":     "https://shopee.sg",
-    "courts_sg":     "https://www.courts.com.sg",
-    "harvey_norman": "https://www.harveynorman.com.sg",
-    "challenger_sg": "https://www.challenger.sg",
-    "buywhere_sg":   "https://www.buywhere.com.sg",
-}
-
-PRODUCT_DOMAINS: frozenset[str] = frozenset({"electronics", "appliances", "computing"})
-
-# ---------------------------------------------------------------------------
-# Database schema (idempotent DDL executed at startup)
-# ---------------------------------------------------------------------------
-
-DDL_STATEMENTS: list[str] = [
-    """
-    CREATE TABLE IF NOT EXISTS sg_vendor_listings (
-        listing_id      TEXT        PRIMARY KEY,
-        product_sku     TEXT        NOT NULL,
-        vendor_key      TEXT        NOT NULL,
-        vendor_name     TEXT        NOT NULL,
-        price_sgd       NUMERIC(12,2) NOT NULL,
-        currency        TEXT        NOT NULL DEFAULT 'SGD',
-        availability    TEXT        NOT NULL,
-        product_name    TEXT        NOT NULL,
-        product_domain  TEXT        NOT NULL,
-        product_url     TEXT,
-        scraped_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        CHECK (product_domain IN ('electronics','appliances','computing'))
-    )
-    """,
-    "CREATE INDEX IF NOT EXISTS idx_listings_sku    ON sg_vendor_listings(product_sku)",
-    "CREATE INDEX IF NOT EXISTS idx_listings_domain ON sg_vendor_listings(product_domain)",
-    """
-    CREATE TABLE IF NOT EXISTS sg_price_history (
-        id              BIGSERIAL   PRIMARY KEY,
-        product_sku     TEXT        NOT NULL,
-        vendor_key      TEXT        NOT NULL,
-        price_sgd       NUMERIC(12,2) NOT NULL,
-        availability    TEXT        NOT NULL,
-        recorded_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-    """,
-    "CREATE INDEX IF NOT EXISTS idx_history_sku_vendor ON sg_price_history(product_sku, vendor_key)",
-    "CREATE INDEX IF NOT EXISTS idx_history_recorded   ON sg_price_history(recorded_at DESC)",
-    """
-    CREATE TABLE IF NOT EXISTS sg_api_keys (
-        api_key         TEXT        PRIMARY KEY,
-        owner           TEXT        NOT NULL,
-        rate_limit_rpm  INT         NOT NULL DEFAULT 60,
-        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        active          BOOLEAN     NOT NULL DEFAULT TRUE
-    )
-    """,
-    """
-    INSERT INTO sg_api_keys(api_key, owner, rate_limit_rpm)
-    VALUES('dev-test-key-sg-2024', 'dev', 300)
-    ON CONFLICT DO NOTHING
-    """,
-]
-
-# ---------------------------------------------------------------------------
-# Application lifespan: DB pool + Redis init
-# ---------------------------------------------------------------------------
-
-_db_pool: asyncpg.Pool | None = None
-_redis: aioredis.Redis | None = None
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global _db_pool, _redis
-    _db_pool = await asyncpg.create_pool(
-        DATABASE_URL,
-        min_size=4,
-        max_size=16,
-        command_timeout=30,
-    )
-    async with _db_pool.acquire() as conn:
-        for ddl in DDL_STATEMENTS:
-            await conn.execute(ddl)
-    _redis = await aioredis.from_url(REDIS_URL, decode_responses=True)
-    logger.info("BuyWhere SG API ready -- DB pool + Redis connected")
-    yield
-    await _db_pool.close()
-    await _redis.aclose()
-
+logger = logging.getLogger("buywhere_singapore_api")
 
 app = FastAPI(
-    title="BuyWhere SG Price Intelligence API",
-    description=(
-        "Unified price comparison across Singapore retailers "
-        "(Lazada, Shopee, Courts, Harvey Norman, Challenger) "
-        "with SGD price history, availability metadata, "
-        "and Shannon entropy-based price dispersion analytics. "
-        "LLM-agent ready via MCP tool specs."
-    ),
+    title="BuyWhere Singapore Value Intelligence API",
+    description="Semantic product search over Singapore e-commerce with auditable value-scores derived from Shannon entropy across vendor price distributions.",
     version="1.0.0",
-    lifespan=lifespan,
-    docs_url="/docs",
-    redoc_url="/redoc",
 )
 
-# ---------------------------------------------------------------------------
-# Pydantic models -- strict, domain-specific
-# ---------------------------------------------------------------------------
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=True)
+VALID_API_KEYS = set(filter(None, os.environ.get("BUYWHERE_API_KEYS", "").split(",")))
+BUYWHERE_BASE_URL = os.environ.get("BUYWHERE_BASE_URL", "https://www.buywhere.com.sg")
+REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "12.0"))
+MAX_VENDORS_PER_PRODUCT = 20
+SGD_FLOOR = 0.01
+SGD_CEILING = 1_000_000.0
 
 
-class VendorListing(BaseModel):
-    listing_id:   str
-    vendor_key:   str
-    vendor_name:  str
-    price_sgd:    float
-    currency:     str = "SGD"
-    availability: str = Field(..., pattern="^(online|instore|both|oos)$")
-    product_url:  str | None = None
-    scraped_at:   datetime
+class VendorOffer(BaseModel):
+    vendor_name: str
+    price_sgd: float
+    listing_url: str
+    in_stock: bool
+    intra_session_variance_proxy: float
+    reliability_penalty: float
 
 
-class PriceDispersionStats(BaseModel):
-    """
-    Information-theoretic price dispersion computed over the empirical
-    vendor price distribution at query time.
-    price_dispersion_bits: Shannon entropy H = -sum(p_i * log2(p_i))
-        where p_i = normalized price weight for vendor i.
-    coefficient_of_variation: sigma/mu over vendor prices (unit-free).
-    anomaly_z_scores: per-vendor z-score; |z| > 2.0 flags price anomaly.
-    """
-    price_dispersion_bits:    float
-    min_price_sgd:            float
-    max_price_sgd:            float
-    median_price_sgd:         float
-    mean_price_sgd:           float
+class RankedProduct(BaseModel):
+    product_id: str
+    title: str
+    category: str
+    image_url: Optional[str]
+    vendor_offers: list[VendorOffer]
+    price_min_sgd: float
+    price_max_sgd: float
+    price_mean_sgd: float
+    shannon_entropy_bits: float
+    causal_reliability_score: float
+    value_score: float
+    value_score_explanation: str
+
+
+class ProductSearchResponse(BaseModel):
+    query: str
+    result_count: int
+    currency: str
+    products: list[RankedProduct]
+    computation_ms: float
+
+
+class PriceDistributionResponse(BaseModel):
+    product_id: str
+    title: str
+    vendor_count: int
+    entropy_bits: float
+    entropy_normalized: float
+    price_spread_sgd: float
     coefficient_of_variation: float
-    anomaly_z_scores:         dict[str, float]
-    best_value_vendor:        str
+    interpretation: str
 
 
-class PriceSnapshot(BaseModel):
-    product_sku:            str
-    product_name:           str
-    product_domain:         str
-    query_ts:               datetime
-    listings:               list[VendorListing]
-    dispersion:             PriceDispersionStats
-    data_freshness_seconds: int
+class ValueScoreBreakdownResponse(BaseModel):
+    product_id: str
+    title: str
+    shannon_entropy_bits: float
+    max_possible_entropy_bits: float
+    entropy_component: float
+    reliability_component: float
+    price_rank_component: float
+    composite_value_score: float
+    formula: str
+    recommended_vendor: str
+    recommended_price_sgd: float
 
 
-class PriceHistoryPoint(BaseModel):
-    vendor_key:   str
-    price_sgd:    float
-    availability: str
-    recorded_at:  datetime
+class HealthResponse(BaseModel):
+    status: str
+    upstream_reachable: bool
+    api_version: str
+    timestamp: float
 
 
-class PriceHistoryResponse(BaseModel):
-    product_sku:              str
-    vendor_key:               str | None
-    period_days:              int
-    history:                  list[PriceHistoryPoint]
-    trend_slope_sgd_per_day:  float
-    volatility_sgd:           float
+def _require_api_key(api_key: str = Security(API_KEY_HEADER)) -> str:
+    if not VALID_API_KEYS:
+        logger.warning("No API keys configured — running in open mode (not for production)")
+        return api_key
+    if api_key not in VALID_API_KEYS:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+    return api_key
 
 
-class VendorAvailabilityReport(BaseModel):
-    product_sku:       str
-    vendor_key:        str
-    availability:      str
-    price_sgd:         float
-    instore_locations: list[str]
-    last_checked:      datetime
-    confidence:        float = Field(
-        ..., ge=0.0, le=1.0,
-        description="Bayesian confidence in availability status based on scrape recency",
+def _validate_query(query: str) -> str:
+    if not query or not isinstance(query, str):
+        raise HTTPException(status_code=422, detail="Query must be a non-empty string.")
+    query = query.strip()
+    if len(query) < 2:
+        raise HTTPException(status_code=422, detail="Query must be at least 2 characters.")
+    if len(query) > 256:
+        raise HTTPException(status_code=422, detail="Query must not exceed 256 characters.")
+    return query
+
+
+def _validate_product_id(product_id: str) -> str:
+    if not product_id or not isinstance(product_id, str):
+        raise HTTPException(status_code=422, detail="product_id must be a non-empty string.")
+    product_id = product_id.strip()
+    if len(product_id) < 1 or len(product_id) > 128:
+        raise HTTPException(status_code=422, detail="product_id length must be between 1 and 128 characters.")
+    return product_id
+
+
+def _compute_intra_session_variance_proxy(prices: list[float], vendor_index: int) -> float:
+    if len(prices) < 2:
+        return 0.0
+    arr = np.array(prices, dtype=np.float64)
+    global_std = float(np.std(arr))
+    global_mean = float(np.mean(arr))
+    if global_mean == 0:
+        return 0.0
+    cv = global_std / global_mean
+    price = prices[vendor_index]
+    z_score = abs(price - global_mean) / (global_std + 1e-9)
+    return float(cv * z_score)
+
+
+def _compute_reliability_penalty(variance_proxy: float) -> float:
+    return float(1.0 / (1.0 + np.exp(-variance_proxy + 1.5)))
+
+
+def _compute_shannon_entropy_bits(prices: list[float]) -> float:
+    if len(prices) < 2:
+        return 0.0
+    arr = np.array(prices, dtype=np.float64)
+    price_min = arr.min()
+    price_max = arr.max()
+    price_range = price_max - price_min
+    if price_range < 1e-9:
+        return 0.0
+    relative_positions = (arr - price_min) / price_range
+    bin_count = min(len(arr), 10)
+    counts, _ = np.histogram(relative_positions, bins=bin_count, range=(0.0, 1.0))
+    counts = counts[counts > 0].astype(np.float64)
+    probabilities = counts / counts.sum()
+    h = float(-np.sum(probabilities * np.log2(probabilities + 1e-12)))
+    return round(h, 6)
+
+
+def _compute_causal_reliability_score(vendor_offers_raw: list[dict]) -> float:
+    if not vendor_offers_raw:
+        return 0.5
+    prices = [v["price_sgd"] for v in vendor_offers_raw]
+    variance_proxies = [
+        _compute_intra_session_variance_proxy(prices, i)
+        for i in range(len(prices))
+    ]
+    penalties = [_compute_reliability_penalty(vp) for vp in variance_proxies]
+    mean_penalty = float(np.mean(penalties))
+    causal_score = 1.0 - mean_penalty
+    return round(max(0.0, min(1.0, causal_score)), 6)
+
+
+def _compute_value_score(
+    price_min_sgd: float,
+    price_mean_sgd: float,
+    shannon_entropy_bits: float,
+    causal_reliability_score: float,
+    vendor_count: int,
+) -> tuple[float, str]:
+    max_possible_entropy = float(np.log2(max(vendor_count, 2)))
+    entropy_normalized = shannon_entropy_bits / (max_possible_entropy + 1e-9)
+    price_efficiency = price_min_sgd / (price_mean_sgd + 1e-9)
+    price_rank_component = 1.0 - price_efficiency
+    w_entropy = 0.35
+    w_reliability = 0.40
+    w_price_rank = 0.25
+    value_score = (
+        w_entropy * entropy_normalized
+        + w_reliability * causal_reliability_score
+        + w_price_rank * price_rank_component
     )
-
-
-class SearchResult(BaseModel):
-    product_sku:     str
-    product_name:    str
-    product_domain:  str
-    vendor_count:    int
-    min_price_sgd:   float
-    max_price_sgd:   float
-    best_vendor:     str
-    dispersion_bits: float
-
-
-class SearchResponse(BaseModel):
-    query:         str
-    domain_filter: str | None
-    results:       list[SearchResult]
-    total_found:   int
-    query_ms:      float
-
-
-# ---------------------------------------------------------------------------
-# Internal: authentication dependency
-# ---------------------------------------------------------------------------
-
-
-async def _resolve_api_key(request: Request) -> dict[str, Any]:
-    raw_key = request.headers.get(API_KEY_HEADER)
-    if not raw_key:
-        raise HTTPException(
-            status_code=401,
-            detail=f"Missing {API_KEY_HEADER} header. Obtain a key at https://api.buywhere.sg/keys",
-        )
-    if not isinstance(raw_key, str) or len(raw_key) < 8 or len(raw_key) > 128:
-        raise HTTPException(
-            status_code=401,
-            detail="API key format invalid -- must be 8-128 ASCII characters",
-        )
-
-    cache_key = f"apikey:{hashlib.sha256(raw_key.encode()).hexdigest()[:16]}"
-    cached = await _redis.get(cache_key)
-    if cached:
-        return json.loads(cached)
-
-    async with _db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT owner, rate_limit_rpm FROM sg_api_keys WHERE api_key=$1 AND active=TRUE",
-            raw_key,
-        )
-    if not row:
-        raise HTTPException(status_code=401, detail="API key not found or inactive")
-
-    key_meta = {"owner": row["owner"], "rate_limit_rpm": row["rate_limit_rpm"]}
-    await _redis.setex(cache_key, 300, json.dumps(key_meta))
-    return key_meta
-
-
-async def _check_rate_limit(request: Request, key_meta: dict[str, Any]) -> None:
-    owner = key_meta["owner"]
-    rpm   = key_meta["rate_limit_rpm"]
-    window_key = f"rl:{owner}:{int(time.time()) // 60}"
-    count = await _redis.incr(window_key)
-    if count == 1:
-        await _redis.expire(window_key, 90)
-    if count > rpm:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded: {rpm} requests/min. Retry after {60 - (int(time.time()) % 60)}s",
-        )
-
-
-AuthDep = Annotated[dict[str, Any], Depends(_resolve_api_key)]
-
-# ---------------------------------------------------------------------------
-# Internal: Shannon entropy price dispersion (native numpy implementation)
-# ---------------------------------------------------------------------------
-
-
-def _compute_price_dispersion(
-    vendor_prices: dict[str, float],
-) -> PriceDispersionStats:
-    """
-    Computes information-theoretic and statistical price dispersion
-    over the empirical vendor price distribution.
-
-    Shannon entropy is computed over price-weighted probabilities:
-        p_i = price_i / sum(prices)
-        H   = -sum(p_i * log2(p_i))
-
-    Interpretation: higher H means vendor prices are more spread out
-    (less concentrated), signalling a market with arbitrage opportunity.
-    H=0 means all vendors price identically; H=log2(N) is maximum dispersion.
-
-    Anomaly z-scores: per-vendor (price_i - mu) / sigma.
-    |z| > 2.0 flags a statistically anomalous price at p<0.05 (two-tail).
-    """
-    if not vendor_prices:
-        raise ValueError("vendor_prices must contain at least one entry")
-
-    vendors = list(vendor_prices.keys())
-    prices  = np.array([vendor_prices[v] for v in vendors], dtype=np.float64)
-
-    if np.any(prices <= 0):
-        raise ValueError("All prices must be strictly positive SGD values")
-
-    price_sum  = prices.sum()
-    probs      = prices / price_sum
-    probs_safe = np.clip(probs, 1e-12, 1.0)
-    entropy_bits = float(-np.sum(probs_safe * np.log2(probs_safe)))
-
-    mu    = float(prices.mean())
-    sigma = float(prices.std(ddof=1)) if len(prices) > 1 else 0.0
-    cv    = (sigma / mu) if mu > 0 else 0.0
-
-    if sigma > 0:
-        z_raw = (prices - mu) / sigma
-    else:
-        z_raw = np.zeros_like(prices)
-
-    anomaly_z = {v: float(round(z_raw[i], 4)) for i, v in enumerate(vendors)}
-    best_idx  = int(np.argmin(prices))
-
-    return PriceDispersionStats(
-        price_dispersion_bits=round(entropy_bits, 6),
-        min_price_sgd=round(float(prices.min()), 2),
-        max_price_sgd=round(float(prices.max()), 2),
-        median_price_sgd=round(float(np.median(prices)), 2),
-        mean_price_sgd=round(mu, 2),
-        coefficient_of_variation=round(cv, 6),
-        anomaly_z_scores=anomaly_z,
-        best_value_vendor=vendors[best_idx],
+    value_score = round(max(0.0, min(1.0, value_score)), 6)
+    explanation = (
+        f"value_score={value_score:.4f} = "
+        f"0.35 * H_norm({entropy_normalized:.4f}) + "
+        f"0.40 * reliability({causal_reliability_score:.4f}) + "
+        f"0.25 * price_rank({price_rank_component:.4f}); "
+        f"H={shannon_entropy_bits:.4f} bits over {vendor_count} vendors; "
+        f"price_min={price_min_sgd:.2f} SGD, price_mean={price_mean_sgd:.2f} SGD"
     )
+    return value_score, explanation
 
 
-# ---------------------------------------------------------------------------
-# Internal: Bayesian availability confidence
-# ---------------------------------------------------------------------------
+def _deterministic_product_id(title: str, category: str) -> str:
+    raw = f"{title.lower().strip()}::{category.lower().strip()}"
+    return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
 
-def _bayesian_availability_confidence(
-    scrape_age_seconds: float,
-    ttl_freshness: float = TTL_VENDOR_FRESHNESS,
-) -> float:
-    """
-    Models staleness decay as an exponential distribution:
-        P(still_valid | age) = exp(-lambda * age)
-    where lambda = 1 / ttl_freshness (mean lifetime of a price snapshot).
-    Returns probability in [0, 1] that the cached availability is still accurate.
-    """
-    if scrape_age_seconds < 0:
-        scrape_age_seconds = 0.0
-    lam = 1.0 / max(ttl_freshness, 1.0)
-    confidence = float(np.exp(-lam * scrape_age_seconds))
-    return round(max(0.0, min(1.0, confidence)), 4)
-
-
-# ---------------------------------------------------------------------------
-# Internal: price trend via OLS regression over history
-# ---------------------------------------------------------------------------
-
-
-def _price_trend_slope(
-    history: list[dict[str, Any]],
-) -> tuple[float, float]:
-    """
-    OLS regression of price_sgd ~ elapsed_days.
-    Returns (slope_sgd_per_day, price_volatility_sgd).
-    Volatility is defined as the standard deviation of regression residuals.
-    """
-    if not history or len(history) < 2:
-        return 0.0, 0.0
-
-    now_ts = datetime.now(tz=timezone.utc)
-    days   = np.array(
-        [
-            (now_ts - row["recorded_at"].replace(tzinfo=timezone.utc)).total_seconds() / 86400
-            for row in history
-        ],
-        dtype=np.float64,
-    )
-    prices = np.array([float(row["price_sgd"]) for row in history], dtype=np.float64)
-
-    X = np.column_stack([days, np.ones_like(days)])
-    result, residuals, rank, sv = np.linalg.lstsq(X, prices, rcond=None)
-    slope = float(-result[0])
-
-    if len(residuals) > 0:
-        volatility = float(np.sqrt(residuals[0] / len(prices)))
-    else:
-        fitted     = X @ result
-        residuals_ = prices - fitted
-        volatility = float(np.std(residuals_, ddof=1))
-
-    return round(slope, 6), round(volatility, 4)
-
-
-# ---------------------------------------------------------------------------
-# Internal: scraping + DB persistence (background task)
-# ---------------------------------------------------------------------------
-
-
-async def _scrape_and_persist_vendor(
-    product_sku: str,
-    vendor_key: str,
-    db_pool: asyncpg.Pool,
-) -> None:
-    vendor_url = KNOWN_VENDORS.get(vendor_key)
-    if not vendor_url:
-        logger.warning("Unknown vendor key: %s", vendor_key)
-        return
-
+async def _fetch_buywhere_search(query: str, limit: int) -> list[dict]:
+    params = {"q": query, "limit": limit, "country": "SG", "currency": "SGD"}
     try:
-        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
-            resp = await client.get(
-                f"{vendor_url}/search",
-                params={"q": product_sku},
-                headers={"User-Agent": "BuyWhere-PriceBot/1.0 (+https://api.buywhere.sg/bot)"},
-            )
-            resp.raise_for_status()
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            response = await client.get(f"{BUYWHERE_BASE_URL}/api/search", params=params)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("products", [])
+    except httpx.HTTPStatusError as exc:
+        logger.error("BuyWhere upstream HTTP error: %s", exc)
+        raise HTTPException(
+            status_code=502,
+            detail=f"BuyWhere upstream returned HTTP {exc.response.status_code}.",
+        )
+    except httpx.RequestError as exc:
+        logger.error("BuyWhere upstream unreachable: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="BuyWhere upstream unreachable. Retry after backoff.",
+        )
     except Exception as exc:
-        logger.warning("Scrape failed vendor=%s sku=%s: %s", vendor_key, product_sku, exc)
-        return
-
-    now = datetime.now(tz=timezone.utc)
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE sg_vendor_listings
-               SET scraped_at = $1
-             WHERE product_sku = $2 AND vendor_key = $3
-            """,
-            now,
-            product_sku,
-            vendor_key,
-        )
+        logger.error("Unexpected error fetching BuyWhere data: %s", exc)
+        raise HTTPException(status_code=500, detail="Internal error fetching product data.")
 
 
-async def _refresh_stale_vendors(
-    product_sku: str,
-    stale_vendor_keys: list[str],
-    background_tasks: BackgroundTasks,
-) -> None:
-    sem = asyncio.Semaphore(SCRAPER_CONCURRENCY)
-
-    async def _bounded_scrape(vendor_key: str) -> None:
-        async with sem:
-            await _scrape_and_persist_vendor(product_sku, vendor_key, _db_pool)
-
-    for vk in stale_vendor_keys:
-        background_tasks.add_task(_bounded_scrape, vk)
-
-
-# ---------------------------------------------------------------------------
-# Endpoint 1 -- GET /prices/{product_sku}
-# ---------------------------------------------------------------------------
-
-
-@app.get(
-    "/prices/{product_sku}",
-    response_model=PriceSnapshot,
-    summary="Multi-vendor price snapshot with entropy-based dispersion analytics",
-    tags=["Price Intelligence"],
-)
-async def get_price_snapshot(
-    product_sku: str,
-    background_tasks: BackgroundTasks,
-    key_meta: AuthDep,
-    request: Request,
-    domain: Annotated[
-        str | None,
-        Query(description="Filter by product domain: electronics | appliances | computing"),
-    ] = None,
-) -> PriceSnapshot:
-    """
-    Returns current prices across all tracked SG vendors for a given SKU,
-    plus Shannon entropy price_dispersion_bits and per-vendor anomaly z-scores.
-
-    **When to use:** Primary endpoint for price comparison queries on a known SKU.
-    **When NOT to use:** Use /search when you have a product name, not a SKU.
-    Dispersion bits < 0.3 indicate vendor price collusion or data staleness.
-    """
-    await _check_rate_limit(request, key_meta)
-
-    if not product_sku or not isinstance(product_sku, str):
-        raise HTTPException(status_code=422, detail="product_sku must be a non-empty string")
-    if len(product_sku) > 120:
-        raise HTTPException(status_code=422, detail="product_sku exceeds maximum length of 120 chars")
-    if domain and domain not in PRODUCT_DOMAINS:
-        raise HTTPException(
-            status_code=422,
-            detail=f"domain must be one of: {', '.join(sorted(PRODUCT_DOMAINS))}",
-        )
-
-    cache_key = f"snapshot:{product_sku}:{domain or 'all'}"
-    cached = await _redis.get(cache_key)
-    if cached:
-        return PriceSnapshot(**json.loads(cached))
-
-    query = """
-        SELECT listing_id, vendor_key, vendor_name, price_sgd, currency,
-               availability, product_name, product_domain, product_url, scraped_at
-          FROM sg_vendor_listings
-         WHERE product_sku = $1
-    """
-    params: list[Any] = [product_sku]
-    if domain:
-        query += " AND product_domain = $2"
-        params.append(domain)
-
-    async with _db_pool.acquire() as conn:
-        rows = await conn.fetch(query, *params)
-
-    if not rows:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No listings found for SKU '{product_sku}'. Use /search to discover products.",
-        )
-
-    now = datetime.now(tz=timezone.utc)
-    listings: list[VendorListing] = []
-    stale_vendors: list[str] = []
-    vendor_prices: dict[str, float] = {}
-
-    for row in rows:
-        age_s = (now - row["scraped_at"].replace(tzinfo=timezone.utc)).total_seconds()
-        if age_s > TTL_VENDOR_FRESHNESS:
-            stale_vendors.append(row["vendor_key"])
-
-        listings.append(VendorListing(
-            listing_id=row["listing_id"],
-            vendor_key=row["vendor_key"],
-            vendor_name=row["vendor_name"],
-            price_sgd=float(row["price_sgd"]),
-            currency=row["currency"],
-            availability=row["availability"],
-            product_url=row["product_url"],
-            scraped_at=row["scraped_at"],
-        ))
-        vendor_prices[row["vendor_key"]] = float(row["price_sgd"])
-
-    if len(vendor_prices) < 1:
-        raise HTTPException(status_code=500, detail="Malformed vendor price data in DB")
-
+async def _fetch_buywhere_product(product_id: str) -> Optional[dict]:
     try:
-        dispersion = _compute_price_dispersion(vendor_prices)
-    except ValueError as exc:
-        raise HTTPException(status_code=500, detail=f"Price dispersion computation failed: {exc}")
-
-    oldest_scrape = min(
-        (now - r["scraped_at"].replace(tzinfo=timezone.utc)).total_seconds()
-        for r in rows
-    )
-
-    snapshot = PriceSnapshot(
-        product_sku=product_sku,
-        product_name=rows[0]["product_name"],
-        product_domain=rows[0]["product_domain"],
-        query_ts=now,
-        listings=listings,
-        dispersion=dispersion,
-        data_freshness_seconds=int(oldest_scrape),
-    )
-
-    await _redis.setex(cache_key, TTL_CACHE_SECONDS, snapshot.model_dump_json())
-    if stale_vendors:
-        await _refresh_stale_vendors(product_sku, stale_vendors, background_tasks)
-
-    return snapshot
-
-
-# ---------------------------------------------------------------------------
-# Endpoint 2 -- GET /search
-# ---------------------------------------------------------------------------
-
-
-@app.get(
-    "/search",
-    response_model=SearchResponse,
-    summary="Full-text product search with price summary and dispersion across SG vendors",
-    tags=["Price Intelligence"],
-)
-async def search_products(
-    key_meta: AuthDep,
-    request: Request,
-    q: Annotated[
-        str,
-        Query(min_length=2, max_length=200, description="Product name, model, or brand"),
-    ],
-    domain: Annotated[
-        str | None,
-        Query(description="Narrow by domain: electronics | appliances | computing"),
-    ] = None,
-    limit: Annotated[
-        int,
-        Query(ge=1, le=50, description="Max results returned (default 20)"),
-    ] = 20,
-) -> SearchResponse:
-    """
-    **When to use:** Discovery queries when you have a name/brand but no SKU.
-    **When NOT to use:** If you already have the product SKU, call /prices/{sku} directly
-    -- it is cheaper and returns richer data. Do not use for catalog dumps (limit <= 50).
-    """
-    await _check_rate_limit(request, key_meta)
-
-    if domain and domain not in PRODUCT_DOMAINS:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            response = await client.get(f"{BUYWHERE_BASE_URL}/api/product/{product_id}")
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPStatusError as exc:
         raise HTTPException(
-            status_code=422,
-            detail=f"domain must be one of: {', '.join(sorted(PRODUCT_DOMAINS))}",
+            status_code=502,
+            detail=f"BuyWhere upstream returned HTTP {exc.response.status_code} for product {product_id}.",
         )
+    except httpx.RequestError:
+        raise HTTPException(status_code=503, detail="BuyWhere upstream unreachable.")
 
-    cache_key = f"search:{hashlib.md5(f'{q}:{domain}:{limit}'.encode()).hexdigest()}"
-    cached = await _redis.get(cache_key)
-    if cached:
-        return SearchResponse(**json.loads(cached))
+
+def _normalize_vendor_offers(raw_vendors: list[dict], prices: list[float]) -> list[VendorOffer]:
+    offers = []
+    for i, v in enumerate(raw_vendors):
+        price_sgd = float(v.get("price", 0.0))
+        if not (SGD_FLOOR <= price_sgd <= SGD_CEILING):
+            continue
+        variance_proxy = _compute_intra_session_variance_proxy(prices, i)
+        reliability_penalty = _compute_reliability_penalty(variance_proxy)
+        offers.append(VendorOffer(
+            vendor_name=str(v.get("vendor", "unknown")),
+            price_sgd=round(price_sgd, 2),
+            listing_url=str(v.get("url", "")),
+            in_stock=bool(v.get("in_stock", True)),
+            intra_session_variance_proxy=round(variance_proxy, 6),
+            reliability_penalty=round(reliability_penalty, 6),
+        ))
+    return offers
+
+
+def _build_ranked_product(raw: dict) -> RankedProduct:
+    title = str(raw.get("title", ""))
+    category = str(raw.get("category", ""))
+    product_id = str(raw.get("id", _deterministic_product_id(title, category)))
+    raw_vendors = raw.get("vendors", [])[:MAX_VENDORS_PER_PRODUCT]
+    prices = [
+        float(v.get("price", 0.0))
+        for v in raw_vendors
+        if SGD_FLOOR <= float(v.get("price", 0.0)) <= SGD_CEILING
+    ]
+    if not prices:
+        prices = [0.0]
+    arr = np.array(prices, dtype=np.float64)
+    price_min = float(arr.min())
+    price_max = float(arr.max())
+    price_mean = float(arr.mean())
+    shannon_entropy = _compute_shannon_entropy_bits(prices)
+    causal_reliability = _compute_causal_reliability_score(
+        [{"price_sgd": p} for p in prices]
+    )
+    value_score, explanation = _compute_value_score(
+        price_min, price_mean, shannon_entropy, causal_reliability, len(prices)
+    )
+    vendor_offers = _normalize_vendor_offers(raw_vendors, prices)
+    return RankedProduct(
+        product_id=product_id,
+        title=title,
+        category=category,
+        image_url=raw.get("image_url"),
+        vendor_offers=vendor_offers,
+        price_min_sgd=round(price_min, 2),
+        price_max_sgd=round(price_max, 2),
+        price_mean_sgd=round(price_mean, 2),
+        shannon_entropy_bits=shannon_entropy,
+        causal_reliability_score=causal_reliability,
+        value_score=value_score,
+        value_score_explanation=explanation,
+    )
+
+
+@app.get("/search", response_model=ProductSearchResponse, tags=["core"])
+async def search_singapore_products_by_value_score(
+    query: str,
+    limit: int = 10,
+    min_value_score: float = 0.0,
+    _api_key: str = Depends(_require_api_key),
+):
+    """
+    Semantic product search over BuyWhere Singapore catalog, ranked by composite value-score
+    (Shannon entropy + causal reliability + price rank). Returns structured output ready for
+    direct LLM agent consumption without postprocessing.
+
+    Use this when: an agent needs ranked product recommendations for a Singapore market query
+    with auditable justification per product.
+
+    Do NOT use this for: real-time stock ticker data, non-SGD markets, or exact product ID lookup
+    (use /product/{product_id}/value_breakdown for that).
+    """
+    query = _validate_query(query)
+    if not isinstance(limit, int) or not (1 <= limit <= 50):
+        raise HTTPException(status_code=422, detail="limit must be an integer between 1 and 50.")
+    if not isinstance(min_value_score, float) or not (0.0 <= min_value_score <= 1.0):
+        raise HTTPException(status_code=422, detail="min_value_score must be a float in [0.0, 1.0].")
 
     t0 = time.perf_counter()
-
-    base_query = """
-        SELECT product_sku, product_name, product_domain, vendor_key,
-               price_sgd
-          FROM sg_vendor_listings
-         WHERE to_tsvector('english', product_name) @@ plainto_tsquery('english', $1)
-    """
-    params: list[Any] = [q]
-    if domain:
-        base_query += " AND product_domain = $2"
-        params.append(domain)
-
-    async with _db_pool.acquire() as conn:
-        rows = await conn.fetch(base_query, *params)
-
-    sku_map: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        sku = row["product_sku"]
-        if sku not in sku_map:
-            sku_map[sku] = {
-                "product_name":  row["product_name"],
-                "product_domain": row["product_domain"],
-                "vendor_prices": {},
-            }
-        sku_map[sku]["vendor_prices"][row["vendor_key"]] = float(row["price_sgd"])
-
-    results: list[SearchResult] = []
-    for sku, data in list(sku_map.items())[:limit]:
-        vp = data["vendor_prices"]
-        if not vp:
-            continue
-        try:
-            disp = _compute_price_dispersion(vp)
-        except ValueError:
-            continue
-        results.append(SearchResult(
-            product_sku=sku,
-            product_name=data["product_name"],
-            product_domain=data["product_domain"],
-            vendor_count=len(vp),
-            min_price_sgd=disp.min_price_sgd,
-            max_price_sgd=disp.max_price_sgd,
-            best_vendor=disp.best_value_vendor,
-            dispersion_bits=disp.price_dispersion_bits,
-        ))
-
-    results.sort(key=lambda r: r.dispersion_bits, reverse=True)
+    raw_products = await _fetch_buywhere_search(query, limit)
+    ranked = [_build_ranked_product(r) for r in raw_products]
+    ranked = [p for p in ranked if p.value_score >= min_value_score]
+    ranked.sort(key=lambda p: p.value_score, reverse=True)
     elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
 
-    resp = SearchResponse(
-        query=q,
-        domain_filter=domain,
-        results=results,
-        total_found=len(sku_map),
-        query_ms=elapsed_ms,
-    )
-    await _redis.setex(cache_key, TTL_CACHE_SECONDS, resp.model_dump_json())
-    return resp
-
-
-# ---------------------------------------------------------------------------
-# Endpoint 3 -- GET /history/{product_sku}
-# ---------------------------------------------------------------------------
-
-
-@app.get(
-    "/history/{product_sku}",
-    response_model=PriceHistoryResponse,
-    summary="SGD price history with OLS trend slope and volatility for a SKU",
-    tags=["Price Intelligence"],
-)
-async def get_price_history(
-    product_sku: str,
-    key_meta: AuthDep,
-    request: Request,
-    vendor_key: Annotated[
-        str | None,
-        Query(description="Filter to a single vendor key, e.g. lazada_sg"),
-    ] = None,
-    days: Annotated[
-        int,
-        Query(ge=1, le=365, description="Lookback window in days (max 365)"),
-    ] = 30,
-) -> PriceHistoryResponse:
-    """
-    **When to use:** Trend analysis -- is this product getting cheaper?
-    trend_slope_sgd_per_day < 0 means price is falling.
-    volatility_sgd = OLS residual std dev; high volatility -> unstable pricing.
-    **When NOT to use:** Real-time comparison; use /prices/{sku} for that.
-    Do not call with days > 90 in latency-sensitive pipelines.
-    """
-    await _check_rate_limit(request, key_meta)
-
-    if not product_sku or len(product_sku) > 120:
-        raise HTTPException(status_code=422, detail="product_sku must be 1-120 characters")
-    if vendor_key and vendor_key not in KNOWN_VENDORS:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Unknown vendor_key. Valid values: {', '.join(sorted(KNOWN_VENDORS))}",
-        )
-
-    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
-    query = """
-        SELECT vendor_key, price_sgd, availability, recorded_at
-          FROM sg_price_history
-         WHERE product_sku = $1 AND recorded_at >= $2
-    """
-    params: list[Any] = [product_sku, cutoff]
-    if vendor_key:
-        query += " AND vendor_key = $3"
-        params.append(vendor_key)
-    query += " ORDER BY recorded_at ASC"
-
-    async with _db_pool.acquire() as conn:
-        rows = await conn.fetch(query, *params)
-
-    if not rows:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No price history for SKU '{product_sku}' in the last {days} days.",
-        )
-
-    history_points = [
-        PriceHistoryPoint(
-            vendor_key=r["vendor_key"],
-            price_sgd=float(r["price_sgd"]),
-            availability=r["availability"],
-            recorded_at=r["recorded_at"],
-        )
-        for r in rows
-    ]
-
-    raw_rows = [dict(r) for r in rows]
-    slope, volatility = _price_trend_slope(raw_rows)
-
-    return PriceHistoryResponse(
-        product_sku=product_sku,
-        vendor_key=vendor_key,
-        period_days=days,
-        history=history_points,
-        trend_slope_sgd_per_day=slope,
-        volatility_sgd=volatility,
+    return ProductSearchResponse(
+        query=query,
+        result_count=len(ranked),
+        currency="SGD",
+        products=ranked,
+        computation_ms=elapsed_ms,
     )
 
 
-# ---------------------------------------------------------------------------
-# Endpoint 4 -- GET /availability/{product_sku}/{vendor_key}
-# ---------------------------------------------------------------------------
-
-
-@app.get(
-    "/availability/{product_sku}/{vendor_key}",
-    response_model=VendorAvailabilityReport,
-    summary="Vendor-specific availability with Bayesian confidence score",
-    tags=["Price Intelligence"],
-)
-async def get_vendor_availability(
-    product_sku: str,
-    vendor_key: str,
-    key_meta: AuthDep,
-    request: Request,
-) -> VendorAvailabilityReport:
+@app.get("/product/{product_id}/value_breakdown", response_model=ValueScoreBreakdownResponse, tags=["core"])
+async def get_product_value_score_breakdown(
+    product_id: str,
+    _api_key: str = Depends(_require_api_key),
+):
     """
-    **When to use:** When user intent is to physically visit or order from
-    a specific vendor and needs to confirm stock before routing.
-    confidence field models staleness decay: 1.0 = freshly scraped,
-    < 0.5 = data older than half the TTL window -- treat with caution.
-    **When NOT to use:** Cross-vendor comparison; use /prices/{sku} for that.
-    Do not call in bulk loops -- use /prices/{sku} which returns all vendors at once.
+    Returns the full auditable decomposition of the value-score formula for a specific product:
+    entropy component, reliability component, price rank component, and the recommended vendor.
+
+    Use this when: an LLM agent needs to cite the mathematical justification for a product
+    recommendation (e.g., 'recommended because value_score=0.82 driven by high vendor diversity').
+
+    Do NOT use this for: bulk catalog exploration (use /search for that).
     """
-    await _check_rate_limit(request, key_meta)
+    product_id = _validate_product_id(product_id)
+    raw = await _fetch_buywhere_product(product_id)
+    if raw is None:
+        raise HTTPException(status_code=404, detail=f"Product '{product_id}' not found in BuyWhere catalog.")
 
-    if not product_sku or len(product_sku) > 120:
-        raise HTTPException(status_code=422, detail="product_sku must be 1-120 characters")
-    if vendor_key not in KNOWN_VENDORS:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Unknown vendor_key '{vendor_key}'. Valid: {', '.join(sorted(KNOWN_VENDORS))}",
-        )
+    ranked = _build_ranked_product(raw)
+    prices = [o.price_sgd for o in ranked.vendor_offers]
+    arr = np.array(prices, dtype=np.float64) if prices else np.array([0.0])
+    price_min = float(arr.min())
+    price_mean = float(arr.mean())
+    vendor_count = len(prices)
+    max_possible_entropy = float(np.log2(max(vendor_count, 2)))
+    entropy_normalized = ranked.shannon_entropy_bits / (max_possible_entropy + 1e-9)
+    price_efficiency = price_min / (price_mean + 1e-9)
+    price_rank_component = round(1.0 - price_efficiency, 6)
 
-    async with _db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT price_sgd, availability, scraped_at, vendor_name
-              FROM sg_vendor_listings
-             WHERE product_sku = $1 AND vendor_key = $2
-            """,
-            product_sku,
-            vendor_key,
-        )
+    best_vendor = min(ranked.vendor_offers, key=lambda o: o.price_sgd, default=None)
+    recommended_vendor = best_vendor.vendor_name if best_vendor else "N/A"
+    recommended_price = best_vendor.price_sgd if best_vendor else 0.0
 
-    if not row:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No listing for SKU '{product_sku}' at vendor '{vendor_key}'.",
-        )
-
-    now   = datetime.now(tz=timezone.utc)
-    age_s = (now - row["scraped_at"].replace(tzinfo=timezone.utc)).total_seconds()
-    confidence = _bayesian_availability_confidence(age_s)
-
-    instore_locs: list[str] = []
-    if row["availability"] in ("instore", "both"):
-        instore_locs = _stub_instore_locations(vendor_key)
-
-    return VendorAvailabilityReport(
-        product_sku=product_sku,
-        vendor_key=vendor_key,
-        availability=row["availability"],
-        price_sgd=float(row["price_sgd"]),
-        instore_locations=instore_locs,
-        last_checked=row["scraped_at"],
-        confidence=confidence,
-    )
-
-
-def _stub_instore_locations(vendor_key: str) -> list[str]:
-    """Returns canonical SG store locations per vendor. Replace with DB join in production."""
-    locations: dict[str, list[str]] = {
-        "courts_sg":     ["Tampines Mall", "Jurong Point", "Funan", "NEX Serangoon"],
-        "harvey_norman": ["Millenia Walk", "Park Mall", "Suntec City", "Northpoint City"],
-        "challenger_sg": ["Funan", "Jurong Point", "IMM", "Plaza Singapura"],
-        "lazada_sg":     [],
-        "shopee_sg":     [],
-        "buywhere_sg":   [],
-    }
-    return locations.get(vendor_key, [])
-
-
-# ---------------------------------------------------------------------------
-# Endpoint 5 -- GET /dispersion/domain
-# ---------------------------------------------------------------------------
-
-
-@app.get(
-    "/dispersion/domain",
-    summary="Aggregate Shannon entropy price dispersion report by product domain",
-    tags=["Price Intelligence"],
-)
-async def get_domain_dispersion_report(
-    key_meta: AuthDep,
-    request: Request,
-    domain: Annotated[
-        str,
-        Query(description="Product domain: electronics | appliances | computing"),
-    ],
-    top_n: Annotated[
-        int,
-        Query(ge=1, le=30, description="Return top N SKUs by dispersion (default 10)"),
-    ] = 10,
-) -> JSONResponse:
-    """
-    **When to use:** Market-level analysis -- which product categories or
-    specific SKUs have the highest price variance across SG vendors?
-    High dispersion_bits = arbitrage opportunity or vendor data anomaly.
-    Use to prioritise which SKUs to monitor more frequently.
-    **When NOT to use:** Per-product queries; use /prices/{sku} for that.
-    Results are cached for 5 minutes; not suitable for sub-minute freshness needs.
-    """
-    await _check_rate_limit(request, key_meta)
-
-    if domain not in PRODUCT_DOMAINS:
-        raise HTTPException(
-            status_code=422,
-            detail=f"domain must be one of: {', '.join(sorted(PRODUCT_DOMAINS))}",
-        )
-
-    cache_key = f"dispersion_domain:{domain}:{top_n}"
-    cached = await _redis.get(cache_key)
-    if cached:
-        return JSONResponse(content=json.loads(cached))
-
-    async with _db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT product_sku, product_name, vendor_key, price_sgd
-              FROM sg_vendor_listings
-             WHERE product_domain = $1
-            """,
-            domain,
-        )
-
-    if not rows:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No listings found for domain '{domain}'.",
-        )
-
-    sku_prices: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        sku = row["product_sku"]
-        if sku not in sku_prices:
-            sku_prices[sku] = {"name": row["product_name"], "vendors": {}}
-        sku_prices[sku]["vendors"][row["vendor_key"]] = float(row["price_sgd"])
-
-    dispersion_records: list[dict[str, Any]] = []
-    for sku, data in sku_prices.items():
-        if len(data["vendors"]) < 2:
-            continue
-        try:
-            d = _compute_price_dispersion(data["vendors"])
-        except ValueError:
-            continue
-        dispersion_records.append({
-            "product_sku":     sku,
-            "product_name":    data["name"],
-            "vendor_count":    len(data["vendors"]),
-            "dispersion_bits": d.price_dispersion_bits,
-            "cv":              d.coefficient_of_variation,
-            "min_sgd":         d.min_price_sgd,
-            "max_sgd":         d.max_price_sgd,
-            "best_vendor":     d.best_value_vendor,
-            "anomaly_vendors": [v for v, z in d.anomaly_z_scores.items() if abs(z) > 2.0],
-        })
-
-    dispersion_records.sort(key=lambda r: r["dispersion_bits"], reverse=True)
-    top_records = dispersion_records[:top_n]
-
-    if dispersion_records:
-        h_values = np.array([r["dispersion_bits"] for r in dispersion_records])
-        domain_mean_entropy = round(float(h_values.mean()), 6)
-        domain_max_entropy  = round(float(h_values.max()), 6)
-        _, p_value = stats.shapiro(h_values) if len(h_values) >= 3 else (0.0, 1.0)
-        entropy_normally_distributed = bool(p_value > 0.05)
-    else:
-        domain_mean_entropy          = 0.0
-        domain_max_entropy           = 0.0
-        entropy_normally_distributed = True
-
-    payload: dict[str, Any] = {
-        "domain":                       domain,
-        "total_skus_analysed":          len(dispersion_records),
-        "domain_mean_entropy_bits":     domain_mean_entropy,
-        "domain_max_entropy_bits":      domain_max_entropy,
-        "entropy_normally_distributed": entropy_normally_distributed,
-        "interpretation": (
-            "Higher dispersion_bits -> greater price spread among vendors -> "
-            "larger savings potential for price-aware buyers. "
-            "anomaly_vendors lists vendors whose price deviates > 2 sigma from mean."
+    return ValueScoreBreakdownResponse(
+        product_id=product_id,
+        title=ranked.title,
+        shannon_entropy_bits=ranked.shannon_entropy_bits,
+        max_possible_entropy_bits=round(max_possible_entropy, 6),
+        entropy_component=round(entropy_normalized, 6),
+        reliability_component=ranked.causal_reliability_score,
+        price_rank_component=price_rank_component,
+        composite_value_score=ranked.value_score,
+        formula=(
+            "value_score = 0.35 * (H / log2(N)) + 0.40 * causal_reliability + 0.25 * (1 - price_min/price_mean); "
+            "H = Shannon entropy in bits over N vendor price distribution; "
+            "causal_reliability = 1 - mean(sigmoid(z_score * CV - 1.5)) per vendor"
         ),
-        "top_dispersed_skus": top_records,
-        "generated_at":       datetime.now(tz=timezone.utc).isoformat(),
-    }
-
-    await _redis.setex(cache_key, 300, json.dumps(payload))
-    return JSONResponse(content=payload)
-
-
-# ---------------------------------------------------------------------------
-# Global exception handlers
-# ---------------------------------------------------------------------------
-
-
-@app.exception_handler(asyncpg.PostgresError)
-async def postgres_error_handler(request: Request, exc: asyncpg.PostgresError) -> JSONResponse:
-    logger.error("DB error on %s: %s", request.url.path, exc)
-    return JSONResponse(
-        status_code=503,
-        content={
-            "error":  "database_unavailable",
-            "detail": "Upstream database error -- retry after 5 seconds",
-        },
+        recommended_vendor=recommended_vendor,
+        recommended_price_sgd=recommended_price,
     )
 
 
-@app.exception_handler(aioredis.RedisError)
-async def redis_error_handler(request: Request, exc: aioredis.RedisError) -> JSONResponse:
-    logger.error("Redis error on %s: %s", request.url.path, exc)
-    return JSONResponse(
-        status_code=503,
-        content={
-            "error":  "cache_unavailable",
-            "detail": "Cache layer unavailable -- request may be retried",
-        },
+@app.get("/product/{product_id}/price_distribution", response_model=PriceDistributionResponse, tags=["core"])
+async def get_product_vendor_price_distribution(
+    product_id: str,
+    _api_key: str = Depends(_require_api_key),
+):
+    """
+    Returns the full price-entropy analysis for a product: spread, coefficient of variation,
+    Shannon entropy, and a human-readable interpretation for LLM reasoning chains.
+
+    Use this when: an agent needs to determine whether a product's price is stable across
+    vendors (low entropy) or volatile/competitive (high entropy) before making a recommendation.
+
+    Do NOT use this for: value-score ranking across multiple products (use /search for that).
+    """
+    product_id = _validate_product_id(product_id)
+    raw = await _fetch_buywhere_product(product_id)
+    if raw is None:
+        raise HTTPException(status_code=404, detail=f"Product '{product_id}' not found in BuyWhere catalog.")
+
+    ranked = _build_ranked_product(raw)
+    prices = [o.price_sgd for o in ranked.vendor_offers]
+    if not prices:
+        raise HTTPException(status_code=422, detail="No valid vendor offers with SGD prices found for this product.")
+
+    arr = np.array(prices, dtype=np.float64)
+    price_spread = round(float(arr.max() - arr.min()), 2)
+    mean = float(arr.mean())
+    std = float(arr.std())
+    cv = round(std / (mean + 1e-9), 6)
+    vendor_count = len(prices)
+    max_possible_entropy = float(np.log2(max(vendor_count, 2)))
+    entropy_normalized = round(ranked.shannon_entropy_bits / (max_possible_entropy + 1e-9), 6)
+
+    if entropy_normalized < 0.25:
+        interpretation = (
+            f"Price is highly stable across {vendor_count} vendors (H={ranked.shannon_entropy_bits:.3f} bits, "
+            f"normalized={entropy_normalized:.3f}). Low vendor competition — less negotiation leverage for buyer."
+        )
+    elif entropy_normalized < 0.65:
+        interpretation = (
+            f"Moderate price dispersion across {vendor_count} vendors (H={ranked.shannon_entropy_bits:.3f} bits, "
+            f"normalized={entropy_normalized:.3f}). Some vendor differentiation — recommend comparing top 3 offers."
+        )
+    else:
+        interpretation = (
+            f"High price volatility across {vendor_count} vendors (H={ranked.shannon_entropy_bits:.3f} bits, "
+            f"normalized={entropy_normalized:.3f}). Strong market fragmentation — buyer has significant arbitrage opportunity."
+        )
+
+    return PriceDistributionResponse(
+        product_id=product_id,
+        title=ranked.title,
+        vendor_count=vendor_count,
+        entropy_bits=ranked.shannon_entropy_bits,
+        entropy_normalized=entropy_normalized,
+        price_spread_sgd=price_spread,
+        coefficient_of_variation=cv,
+        interpretation=interpretation,
     )
 
 
-# ---------------------------------------------------------------------------
-# Health check (unauthenticated, for load balancer probes)
-# ---------------------------------------------------------------------------
+@app.get("/health", response_model=HealthResponse, tags=["ops"])
+async def check_api_and_upstream_health():
+    """
+    Returns liveness status and whether BuyWhere upstream is reachable.
 
+    Use this for: health checks, uptime monitors, deployment readiness probes.
 
-@app.get("/healthz", include_in_schema=False)
-async def health_check() -> JSONResponse:
-    checks: dict[str, str] = {}
+    Do NOT use this for: product queries or value-score computations.
+    """
+    upstream_ok = False
     try:
-        async with _db_pool.acquire() as conn:
-            await conn.fetchval("SELECT 1")
-        checks["db"] = "ok"
-    except Exception as exc:
-        checks["db"] = f"error: {exc}"
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{BUYWHERE_BASE_URL}/api/ping")
+            upstream_ok = r.status_code < 500
+    except Exception:
+        upstream_ok = False
 
-    try:
-        await _redis.ping()
-        checks["redis"] = "ok"
-    except Exception as exc:
-        checks["redis"] = f"error: {exc}"
-
-    healthy = all(v == "ok" for v in checks.values())
-    return JSONResponse(
-        status_code=200 if healthy else 503,
-        content={"status": "healthy" if healthy else "degraded", "checks": checks},
+    return HealthResponse(
+        status="ok",
+        upstream_reachable=upstream_ok,
+        api_version="1.0.0",
+        timestamp=time.time(),
     )
 
+# --- NEXUS: servidor MCP real montado en el mismo proceso (inyectado por forge_agent) ---
+# Reemplaza el wrapper Node/TypeScript separado -- un solo deploy, sin
+# segundo servicio, sin salto de red interno. Ver mcp_wrapper_generator.py
+# (v2.0) para el razonamiento completo, incluido el gotcha de
+# session_manager que explica el patron startup/shutdown de abajo.
 
-# ---------------------------------------------------------------------------
-# MCP server (in-process, mounted on the same FastAPI app)
-# ---------------------------------------------------------------------------
+from typing import Annotated, Any, Literal
+from contextlib import AsyncExitStack as _NexusMcpExitStack
 
-_nexus_mcp = _NexusFastMCP(
-    "nexus-buywhere-sg-price-intelligence",
-    stateless_http=True,
-)
+import httpx
+from pydantic import Field
+from mcp.server.fastmcp import FastMCP as _NexusFastMCP
+
+_nexus_mcp = _NexusFastMCP('nexus-useful-data-source-for-agents-doing-prod', stateless_http=True)
 
 
 async def _nexus_mcp_call_core(method: str, path: str, params: dict) -> Any:
+    """
+    Llama al endpoint real del core -- via ASGI in-process (sin red
+    real, sin segundo proceso), no un HTTP call externo. `app` ya
+    existe en este mismo modulo (es el FastAPI que FORGE genero).
+    """
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://nexus-internal") as client:
         if method == "GET":
@@ -1065,330 +518,55 @@ async def _nexus_mcp_call_core(method: str, path: str, params: dict) -> Any:
         return resp.json()
 
 
-@_nexus_mcp.tool(
-    name="buywhere_sg_compare_vendor_prices",
-    description=(
-        "Fetches live multi-vendor price listings for a specific product from BuyWhere "
-        "Singapore and returns a unified schema with vendor name, SGD price, stock status "
-        "(physical store vs online), and a Shannon entropy price dispersion score. "
-        "Use when an agent needs to find the cheapest available option for a known product "
-        "across vendors. Do NOT use for broad category discovery or when the product name "
-        "is ambiguous -- use buywhere_sg_resolve_product_catalog first to obtain a canonical "
-        "product_id."
-    ),
-)
-async def buywhere_sg_compare_vendor_prices(
-    product_id: Annotated[
-        str,
-        Field(
-            ...,
-            description=(
-                "Canonical BuyWhere product identifier (e.g. 'bw-sg-12345'). "
-                "Must be obtained from buywhere_sg_resolve_product_catalog before calling."
-            ),
-            min_length=6,
-            max_length=64,
-        ),
-    ],
-    availability_filter: Annotated[
-        str,
-        Field(
-            "all",
-            description=(
-                "Filter vendors by fulfillment type. "
-                "Accepted values: 'online_only', 'physical_only', 'all'."
-            ),
-            min_length=3,
-            max_length=13,
-        ),
-    ],
-    include_out_of_stock: Annotated[
-        bool,
-        Field(
-            False,
-            description=(
-                "If true, includes vendors with zero stock in the response. "
-                "Useful for historical context but not for purchase decisions."
-            ),
-        ),
-    ],
-) -> dict[str, Any]:
-    params = {
-        "product_id":           product_id,
-        "availability_filter":  availability_filter,
-        "include_out_of_stock": include_out_of_stock,
-    }
-    return await _nexus_mcp_call_core(
-        "POST",
-        f"/v1/buywhere/products/{product_id}/vendor-price-comparison",
-        params,
-    )
+@_nexus_mcp.tool(name='nexus_useful_data_source_for_agents_doing_prod_rank_buywhere_products_by_value_score', description="Searches the BuyWhere Singapore catalogue for products matching a natural-language query and returns them ranked by an auditable value-score derived from information-theoretic entropy of cross-vendor price variance. Use this when an agent needs to compare multiple products across vendors and justify a recommendation beyond lowest-price. Do NOT use for exact SKU or model-number lookups where identity matters more than value ranking, and do NOT use when the agent needs only a single vendor's listing.")
+async def rank_buywhere_products_by_value_score(query: Annotated[str, Field(..., description="Natural-language product description, e.g. 'noise-cancelling wireless headphones under SGD 300'. Must be in English.", min_length=3, max_length=300)], top_k: Annotated[float, Field(10, description='Maximum number of ranked products to return. Higher values increase latency. Recommended 5-20 for agent consumption.', ge=1, le=50)], max_price_sgd: Annotated[float, Field(None, description='Hard upper bound on product price in SGD. Products strictly above this value are excluded before ranking. Set to null to disable.', ge=0.01, le=99999.99)], category_filter: Annotated[str, Field(None, description="BuyWhere top-level category slug to restrict the search scope, e.g. 'electronics', 'home-appliances', 'health-beauty'. Leave null for cross-category search.", min_length=2, max_length=60)]) -> dict[str, Any]:
+    """Rank BuyWhere Products by Value Score"""
+    params = {"query": query, "top_k": top_k, "max_price_sgd": max_price_sgd, "category_filter": category_filter}
+    return await _nexus_mcp_call_core('POST', '/buywhere/rank-by-value-score', params)
+
+@_nexus_mcp.tool(name='nexus_useful_data_source_for_agents_doing_prod_fetch_buywhere_vendor_price_distribution', description='Given a BuyWhere product identifier, returns the full cross-vendor price distribution in SGD along with the Shannon entropy of that distribution and a causal price-spread coefficient that quantifies whether price differences are driven by vendor margin or by product condition/variant. Use this when an agent already knows the product and needs to audit price fairness or detect outlier vendor pricing. Do NOT use as a discovery tool — it requires a known BuyWhere product_id. Do NOT use when only the cheapest vendor matters and no justification is needed.')
+async def fetch_buywhere_vendor_price_distribution(product_id: Annotated[str, Field(..., description='BuyWhere internal product identifier as returned by rank_buywhere_products_by_value_score or resolve_buywhere_product_identity. Format: alphanumeric string.', min_length=4, max_length=64)], include_out_of_stock: Annotated[bool, Field(False, description='If true, vendors with current stock_status=out_of_stock are included in the distribution for historical completeness. If false, only in-stock vendors are used. Default false to reflect actionable prices.')]) -> dict[str, Any]:
+    """Fetch Vendor Price Distribution for SKU"""
+    params = {"product_id": product_id, "include_out_of_stock": include_out_of_stock}
+    return await _nexus_mcp_call_core('POST', '/buywhere/vendor-price-distribution', params)
+
+@_nexus_mcp.tool(name='nexus_useful_data_source_for_agents_doing_prod_resolve_buywhere_product_identity', description='Takes an ambiguous product name or partial model number and returns the canonical BuyWhere product_id with a semantic similarity score and disambiguation metadata. Use this before calling fetch_buywhere_vendor_price_distribution when the agent has a user-supplied name that may match multiple listings. Do NOT use when the agent already holds a validated product_id from a previous tool call — redundant resolution adds latency. Do NOT use for open-ended exploratory queries; use rank_buywhere_products_by_value_score instead.')
+async def resolve_buywhere_product_identity(raw_product_name: Annotated[str, Field(..., description="Partial or ambiguous product name, brand + model fragment, or user-typed string. E.g. 'Sony WH-1000' or 'dyson v11 vacuum'.", min_length=2, max_length=200)], candidate_limit: Annotated[float, Field(3, description='Number of candidate product identities to return when the match is ambiguous. The agent should surface these to the user if score < 0.90.', ge=1, le=10)]) -> dict[str, Any]:
+    """Resolve Product Identity from Partial Description"""
+    params = {"raw_product_name": raw_product_name, "candidate_limit": candidate_limit}
+    return await _nexus_mcp_call_core('POST', '/buywhere/resolve-product-identity', params)
+
+@_nexus_mcp.tool(name='nexus_useful_data_source_for_agents_doing_prod_compare_buywhere_products_causal_rank', description='Accepts a list of BuyWhere product_ids and returns a causal ranking that controls for confounders (brand premium, recency bias, vendor count asymmetry) using do-calculus-inspired adjustment on the value-score. Use this when an agent has a shortlist of 2-10 products and needs a defensible recommendation that is not contaminated by spurious correlations. Do NOT use with more than 10 products — use rank_buywhere_products_by_value_score for larger candidate sets. Do NOT use when the comparison must be within a single vendor.')
+async def compare_buywhere_products_causal_rank(product_ids: Annotated[list[str], Field(..., description='List of BuyWhere product identifiers to compare. Must contain between 2 and 10 items. Order does not affect output ranking.', min_length=2, max_length=10)], adjustment_covariates: Annotated[list[str], Field(None, description="Confounders to adjust for in the causal model. Accepted values: 'brand_premium', 'vendor_count_bias', 'recency_bias', 'condition_variant'. Defaults to all four if omitted.")]) -> dict[str, Any]:
+    """Causal Rank Comparison Across Product List"""
+    params = {"product_ids": product_ids, "adjustment_covariates": adjustment_covariates}
+    return await _nexus_mcp_call_core('POST', '/buywhere/causal-rank-comparison', params)
+
+@_nexus_mcp.tool(name='nexus_useful_data_source_for_agents_doing_prod_extract_buywhere_deal_anomalies', description='Scans a BuyWhere category or query result for listings whose price deviates significantly from the expected distribution (z-score threshold configurable) and flags them as anomalies — potential flash sales, data errors, or grey-market listings. Returns anomaly type classification and confidence. Use this when an agent is doing price-monitoring or deal-hunting on behalf of a user. Do NOT use as a general ranking tool — anomalies are not always good deals (errors and grey-market items are also flagged). Do NOT call on product_ids already confirmed as anomalies in the same session.')
+async def extract_buywhere_deal_anomalies(query_or_category: Annotated[str, Field(..., description='Either a natural-language product query or a BuyWhere category slug. The tool resolves which interpretation applies based on format.', min_length=2, max_length=200)], z_score_threshold: Annotated[float, Field(2.0, description='Minimum absolute z-score (relative to category price distribution) for a listing to be classified as anomalous. Lower values return more candidates with lower confidence; higher values return fewer with higher confidence. Typical useful range 1.5-3.0.', ge=0.5, le=4.0)], anomaly_types: Annotated[list[str], Field(None, description="Filter output to specific anomaly classifications. Accepted values: 'price_too_low', 'price_too_high', 'vendor_outlier', 'possible_data_error'. Defaults to all types if omitted.")]) -> dict[str, Any]:
+    """Extract Statistically Anomalous Deals"""
+    params = {"query_or_category": query_or_category, "z_score_threshold": z_score_threshold, "anomaly_types": anomaly_types}
+    return await _nexus_mcp_call_core('POST', '/buywhere/deal-anomaly-detection', params)
 
 
-@_nexus_mcp.tool(
-    name="buywhere_sg_resolve_product_catalog",
-    description=(
-        "Searches the BuyWhere Singapore catalog by natural-language query or partial product "
-        "name within a given domain (electronics, appliances, computing) and returns ranked "
-        "canonical product records including product_id, normalized title, brand, and model "
-        "number. Use as the mandatory first step before calling buywhere_sg_compare_vendor_prices "
-        "or buywhere_sg_fetch_sgd_price_history. Do NOT use if you already hold a valid "
-        "product_id -- it adds unnecessary latency and cost."
-    ),
-)
-async def buywhere_sg_resolve_product_catalog(
-    query: Annotated[
-        str,
-        Field(
-            ...,
-            description=(
-                "Natural-language or keyword product query "
-                "(e.g. 'Samsung 65 inch QLED TV 2024'). "
-                "Must be specific enough to narrow results to a single product model."
-            ),
-            min_length=3,
-            max_length=200,
-        ),
-    ],
-    domain: Annotated[
-        str,
-        Field(
-            ...,
-            description=(
-                "Product domain to scope the search. "
-                "Accepted values: 'electronics', 'appliances', 'computing'."
-            ),
-            min_length=8,
-            max_length=11,
-        ),
-    ],
-    max_results: Annotated[
-        int,
-        Field(
-            5,
-            description=(
-                "Maximum number of catalog candidates to return. "
-                "Increase only when the query is known to be ambiguous."
-            ),
-            ge=1,
-            le=20,
-        ),
-    ],
-) -> dict[str, Any]:
-    params = {"query": query, "domain": domain, "max_results": max_results}
-    return await _nexus_mcp_call_core("POST", "/v1/buywhere/catalog/resolve", params)
-
-
-@_nexus_mcp.tool(
-    name="buywhere_sg_fetch_sgd_price_history",
-    description=(
-        "Returns time-series price history in SGD for a specific product across all tracked "
-        "vendors over a requested window. Each data point includes date, vendor_id, price_sgd, "
-        "and availability_type. Also returns a monotone trend coefficient and volatility metric "
-        "(coefficient of variation) computed over the window. Use when an agent needs to "
-        "determine if current prices are high or low relative to recent history, or to detect "
-        "promotional cycles. Do NOT use for real-time best-price comparison -- use "
-        "buywhere_sg_compare_vendor_prices for that. Requires a valid product_id."
-    ),
-)
-async def buywhere_sg_fetch_sgd_price_history(
-    product_id: Annotated[
-        str,
-        Field(
-            ...,
-            description="Canonical BuyWhere product identifier. Obtain from buywhere_sg_resolve_product_catalog.",
-            min_length=6,
-            max_length=64,
-        ),
-    ],
-    window_days: Annotated[
-        int,
-        Field(
-            90,
-            description=(
-                "Number of calendar days of price history to retrieve, counting backwards from today. "
-                "Minimum 7 for meaningful trend detection; maximum 365."
-            ),
-            ge=7,
-            le=365,
-        ),
-    ],
-    vendor_ids: Annotated[
-        list[str] | None,
-        Field(
-            None,
-            description=(
-                "Optional list of vendor identifiers to restrict history to specific vendors. "
-                "If omitted, all vendors with recorded prices are included."
-            ),
-        ),
-    ],
-) -> dict[str, Any]:
-    params = {
-        "product_id":  product_id,
-        "window_days": window_days,
-        "vendor_ids":  vendor_ids,
-    }
-    return await _nexus_mcp_call_core(
-        "POST",
-        f"/v1/buywhere/products/{product_id}/sgd-price-history",
-        params,
-    )
-
-
-@_nexus_mcp.tool(
-    name="buywhere_sg_detect_price_anomalies",
-    description=(
-        "Applies information-theoretic analysis (KL divergence of each vendor price against "
-        "the market price distribution, combined with z-score outlier detection) to identify "
-        "vendors whose current SGD price deviates anomalously from the market consensus for a "
-        "given product. Returns a ranked list of anomalous vendors with deviation direction "
-        "(unusually cheap vs unusually expensive), confidence score, and a plausible cause flag "
-        "(e.g. 'clearance', 'bundle_mislisting', 'data_error'). Use when the agent suspects a "
-        "price is too good or too bad to be real, or when making a high-value purchase decision "
-        "that warrants anomaly validation. Do NOT use as a substitute for "
-        "buywhere_sg_compare_vendor_prices -- this tool adds analytical overhead and should only "
-        "be invoked after raw prices are known."
-    ),
-)
-async def buywhere_sg_detect_price_anomalies(
-    product_id: Annotated[
-        str,
-        Field(..., description="Canonical BuyWhere product identifier.", min_length=6, max_length=64),
-    ],
-    anomaly_sensitivity: Annotated[
-        float,
-        Field(
-            2.0,
-            description=(
-                "Z-score threshold above which a vendor price is flagged as anomalous. "
-                "Lower values increase sensitivity (more flags); higher values reduce false positives. "
-                "Recommended range 1.5 to 3.0."
-            ),
-            ge=1.0,
-            le=4.0,
-        ),
-    ],
-    availability_filter: Annotated[
-        str,
-        Field(
-            "all",
-            description=(
-                "Restrict anomaly detection to a fulfillment type. "
-                "Accepted values: 'online_only', 'physical_only', 'all'."
-            ),
-            min_length=3,
-            max_length=13,
-        ),
-    ],
-) -> dict[str, Any]:
-    params = {
-        "product_id":          product_id,
-        "anomaly_sensitivity": anomaly_sensitivity,
-        "availability_filter": availability_filter,
-    }
-    return await _nexus_mcp_call_core(
-        "POST",
-        f"/v1/buywhere/products/{product_id}/price-anomaly-detection",
-        params,
-    )
-
-
-@_nexus_mcp.tool(
-    name="buywhere_sg_rank_vendors_by_availability_adjusted_value",
-    description=(
-        "Produces a ranked vendor list for a product that jointly optimizes SGD price and "
-        "fulfillment preference using a configurable weighted scoring model. Score combines "
-        "normalized inverse price, in-stock probability (derived from recent stock-status "
-        "history), and a locality bonus if physical_store_proximity_km is provided. Returns "
-        "each vendor's composite score, rank, price_sgd, fulfillment_type, and "
-        "estimated_delivery_days where known. Use when the agent must recommend a single "
-        "vendor that balances cost and practical availability (e.g. user needs item today vs "
-        "willing to wait for cheapest online deal). Do NOT use when the agent only needs raw "
-        "price data without availability weighting -- buywhere_sg_compare_vendor_prices is "
-        "cheaper for that use case."
-    ),
-)
-async def buywhere_sg_rank_vendors_by_availability_adjusted_value(
-    product_id: Annotated[
-        str,
-        Field(..., description="Canonical BuyWhere product identifier.", min_length=6, max_length=64),
-    ],
-    price_weight: Annotated[
-        float,
-        Field(
-            0.6,
-            description=(
-                "Weight assigned to price in the composite score (0.0 to 1.0). "
-                "Must sum to 1.0 with availability_weight."
-            ),
-            ge=0.0,
-            le=1.0,
-        ),
-    ],
-    availability_weight: Annotated[
-        float,
-        Field(
-            0.4,
-            description=(
-                "Weight assigned to stock availability and fulfillment speed (0.0 to 1.0). "
-                "Must sum to 1.0 with price_weight."
-            ),
-            ge=0.0,
-            le=1.0,
-        ),
-    ],
-    physical_store_proximity_km: Annotated[
-        float | None,
-        Field(
-            None,
-            description=(
-                "Optional. User's distance in km from central Singapore reference point "
-                "(1.3521 N, 103.8198 E). When provided, physical vendors within 10 km receive "
-                "a locality bonus in scoring. Omit if delivery preference is irrelevant."
-            ),
-            ge=0.0,
-            le=50.0,
-        ),
-    ],
-    top_n: Annotated[
-        int,
-        Field(
-            3,
-            description=(
-                "Number of top-ranked vendors to return. "
-                "Typically 3 is sufficient; increase only if the agent needs to present alternatives."
-            ),
-            ge=1,
-            le=10,
-        ),
-    ],
-) -> dict[str, Any]:
-    params = {
-        "product_id":                  product_id,
-        "price_weight":                price_weight,
-        "availability_weight":         availability_weight,
-        "physical_store_proximity_km": physical_store_proximity_km,
-        "top_n":                       top_n,
-    }
-    return await _nexus_mcp_call_core(
-        "POST",
-        f"/v1/buywhere/products/{product_id}/availability-adjusted-vendor-ranking",
-        params,
-    )
-
-
+# Crea el sub-app ASGI de streamable HTTP -- DEBE llamarse antes de
+# poder acceder a _nexus_mcp.session_manager (se crea de forma
+# perezosa, ver docstring del modulo).
+# Se monta en "/" (no en "/mcp"): streamable_http_app() YA expone su
+# propia ruta interna en "/mcp" -- montarlo de nuevo en "/mcp" duplica
+# el path a "/mcp/mcp" y da 404 (bug real encontrado probando esto en
+# runtime con un cliente MCP de verdad, no algo teorico).
 _nexus_mcp_asgi_app = _nexus_mcp.streamable_http_app()
-_nexus_mcp_stack    = _NexusMcpExitStack()
+_nexus_mcp_stack = _NexusMcpExitStack()
 
 
 @app.on_event("startup")
-async def _nexus_mcp_startup() -> None:
+async def _nexus_mcp_startup():
     await _nexus_mcp_stack.enter_async_context(_nexus_mcp.session_manager.run())
 
 
 @app.on_event("shutdown")
-async def _nexus_mcp_shutdown() -> None:
+async def _nexus_mcp_shutdown():
     await _nexus_mcp_stack.aclose()
 
 
