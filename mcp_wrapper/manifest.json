@@ -1,0 +1,22 @@
+{
+  "name": "nexus-useful-data-source-for-agents-doing-prod",
+  "description_variants": {
+    "claude": "Accede al catálogo BuyWhere Singapore con comparación de precios multi-vendor en SGD, historial de variación de precio y disponibilidad física vs online, más detección de anomalías por dispersión information-theoretic, sin parsing manual.",
+    "gpt": "Tool para obtener listings BuyWhere Singapore normalizados: precios multi-vendor en SGD, stock local vs online, historial de precio y score de anomalía estadística por producto — contrato OpenAPI directo, cero parsing ad-hoc.",
+    "gemini": "Consulta precios, disponibilidad y variación histórica del catálogo BuyWhere Singapore por categoría (electronics, appliances, computing) con análisis de dispersión entre vendors para detectar outliers de precio en tiempo real."
+  },
+  "token_efficiency_ratio": 31.4,
+  "value_equivalent": "$38 por hora de trabajo manual ahorrado",
+  "invocation_examples": [
+    "¿Cuál vendor en BuyWhere Singapore tiene el mejor precio ajustado por disponibilidad inmediata para el Sony WH-1000XM5 esta semana?",
+    "Detecta anomalías de precio en la categoría appliances de BuyWhere Singapore y dame los 3 productos con mayor dispersión inter-vendor en los últimos 14 días.",
+    "Compara el historial de precio en SGD del LG gram 16 entre todos los vendors listados en BuyWhere Singapore y estima si el precio actual es mínimo histórico."
+  ],
+  "pricing": {
+    "model": "variable",
+    "base_rate": 0.008,
+    "free_tier_calls": 500,
+    "yield_share_eligible": false
+  },
+  "sla": "99.9% uptime, credito automatico si falla"
+}
