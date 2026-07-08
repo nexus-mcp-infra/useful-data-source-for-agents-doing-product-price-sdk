@@ -1,0 +1,10 @@
+asyncpg
+fastapi
+httpx
+mcp
+numpy
+pydantic
+redis
+scipy
+stripe
+uvicorn
