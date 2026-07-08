@@ -6,482 +6,601 @@ const https = require('https');
 const http = require('http');
 const { URL } = require('url');
 
-const BUYWHERE_API_BASE = process.env.BUYWHERE_API_BASE || 'https://api.buywhere-sg.nexus.io/v1';
-const DEFAULT_TIMEOUT_MS = 30000;
-const DEFAULT_MAX_RETRIES = 3;
-const RETRY_BACKOFF_BASE_MS = 500;
+const BUYWHERE_API_BASE = process.env.BUYWHERE_API_BASE || 'https://api.buywhere.sg/v1';
+const DEFAULT_TIMEOUT_MS = 15000;
+const DEFAULT_MAX_RESULTS = 20;
+const MIN_QUERY_LENGTH = 2;
+const MAX_QUERY_LENGTH = 512;
+const VALID_SORT_FIELDS = ['value_score', 'price_sgd', 'reliability_score', 'vendor_count'];
+const VALID_SORT_ORDERS = ['asc', 'desc'];
 
-class BuyWhereSGError extends Error {
+class BuyWhereAuthError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'BuyWhereAuthError';
+    this.statusCode = 401;
+  }
+}
+
+class BuyWhereValidationError extends Error {
+  constructor(message, field) {
+    super(message);
+    this.name = 'BuyWhereValidationError';
+    this.field = field || null;
+    this.statusCode = 400;
+  }
+}
+
+class BuyWhereRateLimitError extends Error {
+  constructor(retryAfterSeconds) {
+    super(`Rate limit exceeded. Retry after ${retryAfterSeconds}s`);
+    this.name = 'BuyWhereRateLimitError';
+    this.retryAfterSeconds = retryAfterSeconds;
+    this.statusCode = 429;
+  }
+}
+
+class BuyWhereAPIError extends Error {
   constructor(message, statusCode, body) {
     super(message);
-    this.name = 'BuyWhereSGError';
-    this.statusCode = statusCode || null;
-    this.body = body || null;
+    this.name = 'BuyWhereAPIError';
+    this.statusCode = statusCode;
+    this.responseBody = body || null;
   }
 }
 
-class AuthenticationError extends BuyWhereSGError {
-  constructor(message) {
-    super(message, 401, null);
-    this.name = 'AuthenticationError';
+function validateApiKey(apiKey) {
+  if (apiKey === null || apiKey === undefined) {
+    throw new BuyWhereAuthError(
+      'API key is required. Pass it via options.apiKey or set BUYWHERE_API_KEY environment variable.'
+    );
   }
-}
-
-class RateLimitError extends BuyWhereSGError {
-  constructor(retryAfterSeconds) {
-    super(`Rate limit exceeded. Retry after ${retryAfterSeconds}s`, 429, null);
-    this.name = 'RateLimitError';
-    this.retryAfterSeconds = retryAfterSeconds;
+  if (typeof apiKey !== 'string') {
+    throw new BuyWhereAuthError(
+      `API key must be a string, received ${typeof apiKey}.`
+    );
   }
-}
-
-class ValidationError extends BuyWhereSGError {
-  constructor(message) {
-    super(message, 400, null);
-    this.name = 'ValidationError';
-  }
-}
-
-const VALID_PRODUCT_DOMAINS = new Set(['electronics', 'appliances', 'computing']);
-const VALID_VENDORS = new Set(['lazada', 'shopee', 'courts', 'harvey_norman', 'all']);
-const VALID_AVAILABILITY = new Set(['online', 'physical', 'both']);
-const VALID_SORT_BY = new Set(['price_asc', 'price_desc', 'dispersion_desc', 'freshness_desc']);
-
-function validateNonEmptyString(value, fieldName) {
-  if (value === null || value === undefined) {
-    throw new ValidationError(`${fieldName} is required and cannot be null or undefined`);
-  }
-  if (typeof value !== 'string') {
-    throw new ValidationError(`${fieldName} must be a string, got ${typeof value}`);
-  }
-  if (value.trim().length === 0) {
-    throw new ValidationError(`${fieldName} cannot be an empty string`);
-  }
-}
-
-function validatePositiveInteger(value, fieldName, min, max) {
-  if (value === null || value === undefined) return;
-  if (typeof value !== 'number' || !Number.isInteger(value)) {
-    throw new ValidationError(`${fieldName} must be an integer, got ${typeof value}`);
-  }
-  if (min !== undefined && value < min) {
-    throw new ValidationError(`${fieldName} must be >= ${min}, got ${value}`);
-  }
-  if (max !== undefined && value > max) {
-    throw new ValidationError(`${fieldName} must be <= ${max}, got ${value}`);
-  }
-}
-
-function validateEnum(value, fieldName, validSet) {
-  if (value === null || value === undefined) return;
-  if (!validSet.has(value)) {
-    throw new ValidationError(
-      `${fieldName} must be one of [${[...validSet].join(', ')}], got "${value}"`
+  if (apiKey.trim().length === 0) {
+    throw new BuyWhereAuthError(
+      'API key must not be an empty string.'
     );
   }
 }
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+function validateSearchQuery(query) {
+  if (query === null || query === undefined) {
+    throw new BuyWhereValidationError(
+      'Search query is required and must not be null or undefined.',
+      'query'
+    );
+  }
+  if (typeof query !== 'string') {
+    throw new BuyWhereValidationError(
+      `Search query must be a string, received ${typeof query}.`,
+      'query'
+    );
+  }
+  const trimmed = query.trim();
+  if (trimmed.length < MIN_QUERY_LENGTH) {
+    throw new BuyWhereValidationError(
+      `Search query must be at least ${MIN_QUERY_LENGTH} characters long.`,
+      'query'
+    );
+  }
+  if (trimmed.length > MAX_QUERY_LENGTH) {
+    throw new BuyWhereValidationError(
+      `Search query must not exceed ${MAX_QUERY_LENGTH} characters.`,
+      'query'
+    );
+  }
+  return trimmed;
 }
 
-function makeRequest(urlString, options, body) {
-  return new Promise((resolve, reject) => {
-    const parsedUrl = new URL(urlString);
-    const isHttps = parsedUrl.protocol === 'https:';
-    const transport = isHttps ? https : http;
+function validateProductId(productId) {
+  if (productId === null || productId === undefined) {
+    throw new BuyWhereValidationError(
+      'Product ID is required and must not be null or undefined.',
+      'productId'
+    );
+  }
+  if (typeof productId !== 'string' && typeof productId !== 'number') {
+    throw new BuyWhereValidationError(
+      `Product ID must be a string or number, received ${typeof productId}.`,
+      'productId'
+    );
+  }
+  const str = String(productId).trim();
+  if (str.length === 0) {
+    throw new BuyWhereValidationError(
+      'Product ID must not be empty.',
+      'productId'
+    );
+  }
+  return str;
+}
 
-    const reqOptions = {
+function validateSearchOptions(options) {
+  const validated = {};
+
+  if (options.maxResults !== undefined) {
+    const n = Number(options.maxResults);
+    if (!Number.isInteger(n) || n < 1 || n > 100) {
+      throw new BuyWhereValidationError(
+        'maxResults must be an integer between 1 and 100.',
+        'maxResults'
+      );
+    }
+    validated.max_results = n;
+  } else {
+    validated.max_results = DEFAULT_MAX_RESULTS;
+  }
+
+  if (options.minPriceSGD !== undefined) {
+    const v = Number(options.minPriceSGD);
+    if (isNaN(v) || v < 0) {
+      throw new BuyWhereValidationError(
+        'minPriceSGD must be a non-negative number.',
+        'minPriceSGD'
+      );
+    }
+    validated.min_price_sgd = v;
+  }
+
+  if (options.maxPriceSGD !== undefined) {
+    const v = Number(options.maxPriceSGD);
+    if (isNaN(v) || v < 0) {
+      throw new BuyWhereValidationError(
+        'maxPriceSGD must be a non-negative number.',
+        'maxPriceSGD'
+      );
+    }
+    validated.max_price_sgd = v;
+  }
+
+  if (
+    validated.min_price_sgd !== undefined &&
+    validated.max_price_sgd !== undefined &&
+    validated.min_price_sgd > validated.max_price_sgd
+  ) {
+    throw new BuyWhereValidationError(
+      'minPriceSGD must not be greater than maxPriceSGD.',
+      'minPriceSGD'
+    );
+  }
+
+  if (options.sortBy !== undefined) {
+    if (!VALID_SORT_FIELDS.includes(options.sortBy)) {
+      throw new BuyWhereValidationError(
+        `sortBy must be one of: ${VALID_SORT_FIELDS.join(', ')}.`,
+        'sortBy'
+      );
+    }
+    validated.sort_by = options.sortBy;
+  }
+
+  if (options.sortOrder !== undefined) {
+    if (!VALID_SORT_ORDERS.includes(options.sortOrder)) {
+      throw new BuyWhereValidationError(
+        `sortOrder must be one of: ${VALID_SORT_ORDERS.join(', ')}.`,
+        'sortOrder'
+      );
+    }
+    validated.sort_order = options.sortOrder;
+  }
+
+  if (options.categories !== undefined) {
+    if (!Array.isArray(options.categories)) {
+      throw new BuyWhereValidationError(
+        'categories must be an array of strings.',
+        'categories'
+      );
+    }
+    for (const cat of options.categories) {
+      if (typeof cat !== 'string' || cat.trim().length === 0) {
+        throw new BuyWhereValidationError(
+          'Each element in categories must be a non-empty string.',
+          'categories'
+        );
+      }
+    }
+    validated.categories = options.categories.map(c => c.trim());
+  }
+
+  if (options.minValueScore !== undefined) {
+    const v = Number(options.minValueScore);
+    if (isNaN(v) || v < 0 || v > 1) {
+      throw new BuyWhereValidationError(
+        'minValueScore must be a number between 0.0 and 1.0.',
+        'minValueScore'
+      );
+    }
+    validated.min_value_score = v;
+  }
+
+  return validated;
+}
+
+function makeHttpRequest(url, options, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const parsedUrl = new URL(url);
+    const isHttps = parsedUrl.protocol === 'https:';
+    const lib = isHttps ? https : http;
+
+    const requestOptions = {
       hostname: parsedUrl.hostname,
       port: parsedUrl.port || (isHttps ? 443 : 80),
       path: parsedUrl.pathname + parsedUrl.search,
       method: options.method || 'GET',
       headers: options.headers || {},
-      timeout: options.timeoutMs || DEFAULT_TIMEOUT_MS,
     };
 
-    const req = transport.request(reqOptions, (res) => {
+    const req = lib.request(requestOptions, (res) => {
       let rawData = '';
-      res.on('data', chunk => { rawData += chunk; });
+      res.on('data', (chunk) => { rawData += chunk; });
       res.on('end', () => {
         resolve({ statusCode: res.statusCode, headers: res.headers, body: rawData });
       });
     });
 
-    req.on('timeout', () => {
+    req.setTimeout(timeoutMs, () => {
       req.destroy();
-      reject(new BuyWhereSGError(`Request timed out after ${options.timeoutMs || DEFAULT_TIMEOUT_MS}ms`));
+      reject(new BuyWhereAPIError(
+        `Request timed out after ${timeoutMs}ms`,
+        408,
+        null
+      ));
     });
 
     req.on('error', (err) => {
-      reject(new BuyWhereSGError(`Network error: ${err.message}`));
+      reject(new BuyWhereAPIError(
+        `Network error: ${err.message}`,
+        0,
+        null
+      ));
     });
 
-    if (body) {
-      req.write(body);
+    if (options.body) {
+      req.write(options.body);
     }
 
     req.end();
   });
 }
 
-async function executeWithRetry(requestFn, maxRetries, methodName) {
-  let lastError;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      return await requestFn();
-    } catch (err) {
-      if (err instanceof RateLimitError) {
-        const waitMs = (err.retryAfterSeconds || 1) * 1000;
-        if (attempt < maxRetries) {
-          await sleep(waitMs);
-          lastError = err;
-          continue;
-        }
-        throw err;
-      }
-      if (err instanceof AuthenticationError || err instanceof ValidationError) {
-        throw err;
-      }
-      if (err instanceof BuyWhereSGError && err.statusCode && err.statusCode < 500) {
-        throw err;
-      }
-      lastError = err;
-      if (attempt < maxRetries) {
-        await sleep(RETRY_BACKOFF_BASE_MS * Math.pow(2, attempt));
-      }
-    }
-  }
-  throw lastError;
-}
+function handleHttpResponse(response) {
+  const { statusCode, headers, body } = response;
 
-class BuyWhereSGClient {
-  constructor(options) {
-    if (!options || typeof options !== 'object') {
-      throw new AuthenticationError(
-        'BuyWhereSGClient requires an options object with an apiKey field'
+  let parsed = null;
+  try {
+    parsed = JSON.parse(body);
+  } catch (_) {
+    if (statusCode < 200 || statusCode >= 300) {
+      throw new BuyWhereAPIError(
+        `API returned non-JSON error response with status ${statusCode}`,
+        statusCode,
+        body
       );
     }
-    if (!options.apiKey || typeof options.apiKey !== 'string' || options.apiKey.trim().length === 0) {
-      throw new AuthenticationError(
-        'BuyWhereSGClient requires a non-empty apiKey. Obtain one at https://buywhere-sg.nexus.io/keys'
-      );
-    }
-
-    this._apiKey = options.apiKey.trim();
-    this._baseUrl = (options.baseUrl || BUYWHERE_API_BASE).replace(/\/$/, '');
-    this._timeoutMs = options.timeoutMs || DEFAULT_TIMEOUT_MS;
-    this._maxRetries = options.maxRetries !== undefined ? options.maxRetries : DEFAULT_MAX_RETRIES;
-
-    validatePositiveInteger(this._timeoutMs, 'timeoutMs', 1000, 120000);
-    validatePositiveInteger(this._maxRetries, 'maxRetries', 0, 10);
   }
 
-  _buildHeaders(extraHeaders) {
-    return Object.assign(
-      {
-        'X-Api-Key': this._apiKey,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'User-Agent': 'buywhere-sg-sdk-js/1.0.0',
-      },
-      extraHeaders || {}
+  if (statusCode === 401) {
+    throw new BuyWhereAuthError(
+      (parsed && parsed.detail) || 'Invalid or expired API key.'
     );
   }
 
-  _buildUrl(path, queryParams) {
-    const url = new URL(this._baseUrl + path);
-    if (queryParams && typeof queryParams === 'object') {
-      for (const [key, value] of Object.entries(queryParams)) {
-        if (value !== null && value !== undefined) {
-          url.searchParams.set(key, String(value));
-        }
-      }
-    }
-    return url.toString();
+  if (statusCode === 429) {
+    const retryAfter = parseInt(headers['retry-after'] || '60', 10);
+    throw new BuyWhereRateLimitError(retryAfter);
   }
 
-  async _request(method, path, queryParams, body) {
-    const urlString = this._buildUrl(path, queryParams);
-    const headers = this._buildHeaders();
-    const serializedBody = body ? JSON.stringify(body) : undefined;
-
-    if (serializedBody) {
-      headers['Content-Length'] = Buffer.byteLength(serializedBody);
-    }
-
-    const doRequest = async () => {
-      const response = await makeRequest(
-        urlString,
-        { method, headers, timeoutMs: this._timeoutMs },
-        serializedBody
-      );
-
-      if (response.statusCode === 401 || response.statusCode === 403) {
-        throw new AuthenticationError(
-          'Invalid or expired API key. Check your credentials at https://buywhere-sg.nexus.io/keys'
-        );
-      }
-
-      if (response.statusCode === 429) {
-        const retryAfter = parseInt(response.headers['retry-after'] || '60', 10);
-        throw new RateLimitError(retryAfter);
-      }
-
-      let parsed;
-      try {
-        parsed = JSON.parse(response.body);
-      } catch (_) {
-        throw new BuyWhereSGError(
-          `Non-JSON response from API (status ${response.statusCode}): ${response.body.slice(0, 200)}`,
-          response.statusCode,
-          response.body
-        );
-      }
-
-      if (response.statusCode === 400) {
-        throw new ValidationError(
-          parsed.detail || parsed.message || 'Validation error from API'
-        );
-      }
-
-      if (response.statusCode >= 400) {
-        throw new BuyWhereSGError(
-          parsed.detail || parsed.message || `API error ${response.statusCode}`,
-          response.statusCode,
-          parsed
-        );
-      }
-
-      return parsed;
-    };
-
-    return executeWithRetry(doRequest, this._maxRetries, `${method} ${path}`);
-  }
-
-  /**
-   * mainMethod — entry point para agentes: resuelve precios multi-vendor con dispersion analysis.
-   * Alias de searchProductPrices para compatibilidad con el contrato `client.mainMethod(data)`.
-   *
-   * @param {object} data
-   * @param {string} data.query - Texto de búsqueda del producto (requerido)
-   * @param {string} [data.domain] - Dominio: 'electronics' | 'appliances' | 'computing'
-   * @param {string} [data.vendor] - Vendor: 'lazada' | 'shopee' | 'courts' | 'harvey_norman' | 'all'
-   * @param {string} [data.availability] - 'online' | 'physical' | 'both'
-   * @param {string} [data.sort_by] - 'price_asc' | 'price_desc' | 'dispersion_desc' | 'freshness_desc'
-   * @param {number} [data.limit] - Resultados a retornar (1-50, default 10)
-   * @param {number} [data.page] - Página de resultados (1+, default 1)
-   * @returns {Promise<PriceSearchResult>}
-   */
-  async mainMethod(data) {
-    return this.searchProductPrices(data);
-  }
-
-  /**
-   * searchProductPrices — busca precios multi-vendor con schema unificado SGD y Shannon dispersion.
-   *
-   * Cuando usarla: cuando un agente necesita comparar precios de un producto entre retailers SG
-   * con metadatos de disponibilidad física u online.
-   *
-   * Cuando NO usarla: para obtener historial de precios de un SKU específico ya identificado
-   * (usar fetchPriceHistory) o para analizar anomalías sobre un conjunto de SKUs (usar detectPriceAnomalies).
-   *
-   * @param {object} params
-   * @returns {Promise<PriceSearchResult>}
-   */
-  async searchProductPrices(params) {
-    if (params === null || params === undefined) {
-      throw new ValidationError(
-        'searchProductPrices requires a params object with at least a "query" field'
-      );
-    }
-    if (typeof params !== 'object' || Array.isArray(params)) {
-      throw new ValidationError(
-        `searchProductPrices expects an object, got ${Array.isArray(params) ? 'array' : typeof params}`
-      );
-    }
-
-    validateNonEmptyString(params.query, 'query');
-    validateEnum(params.domain, 'domain', VALID_PRODUCT_DOMAINS);
-    validateEnum(params.vendor, 'vendor', VALID_VENDORS);
-    validateEnum(params.availability, 'availability', VALID_AVAILABILITY);
-    validateEnum(params.sort_by, 'sort_by', VALID_SORT_BY);
-    validatePositiveInteger(params.limit, 'limit', 1, 50);
-    validatePositiveInteger(params.page, 'page', 1, 1000);
-
-    const queryParams = {
-      q: params.query.trim(),
-      domain: params.domain || undefined,
-      vendor: params.vendor || undefined,
-      availability: params.availability || undefined,
-      sort_by: params.sort_by || undefined,
-      limit: params.limit || 10,
-      page: params.page || 1,
-    };
-
-    return this._request('GET', '/prices', queryParams, null);
-  }
-
-  /**
-   * fetchPriceHistory — retorna el historial de variación de precio en SGD para un SKU específico.
-   *
-   * Cuando usarla: cuando ya tienes un sku_id (obtenido de searchProductPrices) y necesitas
-   * la serie temporal de precios para análisis de tendencia o validación de deal.
-   *
-   * Cuando NO usarla: para descubrimiento de productos — ese es el rol de searchProductPrices.
-   * No admite IDs de producto externos (Lazada/Shopee) directamente.
-   *
-   * @param {string} skuId - SKU unificado BuyWhere (obtenido de searchProductPrices)
-   * @param {object} [options]
-   * @param {number} [options.days] - Ventana de historial en días (1-365, default 30)
-   * @param {string} [options.vendor] - Filtrar historial por vendor específico
-   * @param {string} [options.granularity] - 'hourly' | 'daily' | 'weekly' (default 'daily')
-   * @returns {Promise<PriceHistoryResult>}
-   */
-  async fetchPriceHistory(skuId, options) {
-    validateNonEmptyString(skuId, 'skuId');
-
-    const opts = options || {};
-    if (typeof opts !== 'object' || Array.isArray(opts)) {
-      throw new ValidationError('options must be an object');
-    }
-
-    validatePositiveInteger(opts.days, 'days', 1, 365);
-    validateEnum(opts.vendor, 'vendor', VALID_VENDORS);
-    validateEnum(opts.granularity, 'granularity', new Set(['hourly', 'daily', 'weekly']));
-
-    const queryParams = {
-      days: opts.days || 30,
-      vendor: opts.vendor || undefined,
-      granularity: opts.granularity || 'daily',
-    };
-
-    return this._request('GET', `/prices/${encodeURIComponent(skuId.trim())}/history`, queryParams, null);
-  }
-
-  /**
-   * detectPriceAnomalies — aplica análisis de entropía de Shannon sobre distribución de precios
-   * multi-vendor para identificar SKUs con dispersión anómala en tiempo real.
-   *
-   * Cuando usarla: cuando un agente necesita detectar si un precio específico es outlier
-   * respecto al mercado SG, o para auditar un conjunto de SKUs buscando manipulación de precio.
-   *
-   * Cuando NO usarla: para búsqueda de productos (usar searchProductPrices) o para historial
-   * de un solo SKU (usar fetchPriceHistory). Requiere entre 2 y 100 SKUs por llamada.
-   *
-   * @param {string[]} skuIds - Array de SKU IDs unificados BuyWhere (2-100 elementos)
-   * @param {object} [options]
-   * @param {number} [options.dispersion_threshold_bits] - Umbral mínimo de bits para reportar anomalía (default 1.5)
-   * @param {string} [options.domain] - Filtrar por dominio de producto
-   * @returns {Promise<AnomalyDetectionResult>}
-   */
-  async detectPriceAnomalies(skuIds, options) {
-    if (skuIds === null || skuIds === undefined) {
-      throw new ValidationError('skuIds is required and cannot be null or undefined');
-    }
-    if (!Array.isArray(skuIds)) {
-      throw new ValidationError(`skuIds must be an array, got ${typeof skuIds}`);
-    }
-    if (skuIds.length < 2) {
-      throw new ValidationError(
-        `skuIds must contain at least 2 SKUs for dispersion analysis, got ${skuIds.length}`
-      );
-    }
-    if (skuIds.length > 100) {
-      throw new ValidationError(
-        `skuIds cannot exceed 100 elements per call, got ${skuIds.length}. Split into batches.`
-      );
-    }
-
-    for (let i = 0; i < skuIds.length; i++) {
-      if (typeof skuIds[i] !== 'string' || skuIds[i].trim().length === 0) {
-        throw new ValidationError(
-          `skuIds[${i}] must be a non-empty string, got ${JSON.stringify(skuIds[i])}`
-        );
-      }
-    }
-
-    const opts = options || {};
-    if (typeof opts !== 'object' || Array.isArray(opts)) {
-      throw new ValidationError('options must be an object');
-    }
-
-    if (opts.dispersion_threshold_bits !== undefined && opts.dispersion_threshold_bits !== null) {
-      if (typeof opts.dispersion_threshold_bits !== 'number' || opts.dispersion_threshold_bits < 0) {
-        throw new ValidationError('dispersion_threshold_bits must be a non-negative number');
-      }
-    }
-
-    validateEnum(opts.domain, 'domain', VALID_PRODUCT_DOMAINS);
-
-    const body = {
-      sku_ids: skuIds.map(id => id.trim()),
-      dispersion_threshold_bits: opts.dispersion_threshold_bits !== undefined
-        ? opts.dispersion_threshold_bits
-        : 1.5,
-      domain: opts.domain || undefined,
-    };
-
-    return this._request('POST', '/prices/anomalies', null, body);
-  }
-
-  /**
-   * resolveVendorAvailability — verifica disponibilidad en tiempo real (stock + tienda física)
-   * para un SKU en un vendor específico sin disparar un re-scrape completo del catálogo.
-   *
-   * Cuando usarla: paso final antes de recomendar un producto a un usuario — confirma stock
-   * y ubicación de tienda física si availability='physical' o 'both'.
-   *
-   * Cuando NO usarla: para comparación de precios entre múltiples vendors (usar searchProductPrices)
-   * o si solo necesitas el precio sin importar el stock actual.
-   *
-   * @param {string} skuId - SKU unificado BuyWhere
-   * @param {string} vendor - Vendor a consultar ('lazada' | 'shopee' | 'courts' | 'harvey_norman')
-   * @param {object} [options]
-   * @param {string} [options.postal_code] - Código postal SG de 6 dígitos para proximidad de tienda
-   * @returns {Promise<VendorAvailabilityResult>}
-   */
-  async resolveVendorAvailability(skuId, vendor, options) {
-    validateNonEmptyString(skuId, 'skuId');
-    validateNonEmptyString(vendor, 'vendor');
-
-    const vendorWithoutAll = new Set(['lazada', 'shopee', 'courts', 'harvey_norman']);
-    validateEnum(vendor, 'vendor', vendorWithoutAll);
-
-    const opts = options || {};
-    if (typeof opts !== 'object' || Array.isArray(opts)) {
-      throw new ValidationError('options must be an object');
-    }
-
-    if (opts.postal_code !== undefined && opts.postal_code !== null) {
-      if (typeof opts.postal_code !== 'string') {
-        throw new ValidationError('postal_code must be a string');
-      }
-      if (!/^\d{6}$/.test(opts.postal_code)) {
-        throw new ValidationError(
-          `postal_code must be a 6-digit Singapore postal code, got "${opts.postal_code}"`
-        );
-      }
-    }
-
-    const queryParams = {
-      vendor: vendor.trim(),
-      postal_code: opts.postal_code || undefined,
-    };
-
-    return this._request(
-      'GET',
-      `/prices/${encodeURIComponent(skuId.trim())}/availability`,
-      queryParams,
+  if (statusCode === 400) {
+    throw new BuyWhereValidationError(
+      (parsed && parsed.detail) || `Bad request: ${body}`,
       null
     );
   }
+
+  if (statusCode < 200 || statusCode >= 300) {
+    throw new BuyWhereAPIError(
+      (parsed && parsed.detail) || `API error with status ${statusCode}`,
+      statusCode,
+      body
+    );
+  }
+
+  return parsed;
 }
 
-module.exports = BuyWhereSGClient;
-module.exports.BuyWhereSGClient = BuyWhereSGClient;
-module.exports.BuyWhereSGError = BuyWhereSGError;
-module.exports.AuthenticationError = AuthenticationError;
-module.exports.RateLimitError = RateLimitError;
-module.exports.ValidationError = ValidationError;
+class BuyWhereSingaporeClient {
+  constructor(options) {
+    if (options === null || options === undefined) {
+      options = {};
+    }
+    if (typeof options !== 'object' || Array.isArray(options)) {
+      throw new BuyWhereValidationError(
+        'Client options must be a plain object.',
+        'options'
+      );
+    }
+
+    const apiKey = options.apiKey || process.env.BUYWHERE_API_KEY;
+    validateApiKey(apiKey);
+
+    this._apiKey = apiKey;
+    this._baseUrl = (options.baseUrl || BUYWHERE_API_BASE).replace(/\/$/, '');
+    this._timeoutMs = options.timeoutMs !== undefined
+      ? Number(options.timeoutMs)
+      : DEFAULT_TIMEOUT_MS;
+
+    if (isNaN(this._timeoutMs) || this._timeoutMs < 500 || this._timeoutMs > 60000) {
+      throw new BuyWhereValidationError(
+        'timeoutMs must be a number between 500 and 60000.',
+        'timeoutMs'
+      );
+    }
+  }
+
+  _buildHeaders() {
+    return {
+      'Authorization': `Bearer ${this._apiKey}`,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'X-Client': 'buywhere-sg-sdk-node/1.0.0',
+    };
+  }
+
+  async _get(path, queryParams) {
+    const url = new URL(this._baseUrl + path);
+    if (queryParams) {
+      for (const [key, value] of Object.entries(queryParams)) {
+        if (value !== undefined && value !== null) {
+          if (Array.isArray(value)) {
+            for (const v of value) {
+              url.searchParams.append(key, String(v));
+            }
+          } else {
+            url.searchParams.set(key, String(value));
+          }
+        }
+      }
+    }
+
+    const response = await makeHttpRequest(
+      url.toString(),
+      { method: 'GET', headers: this._buildHeaders() },
+      this._timeoutMs
+    );
+
+    return handleHttpResponse(response);
+  }
+
+  async _post(path, bodyObject) {
+    const url = this._baseUrl + path;
+    const bodyStr = JSON.stringify(bodyObject);
+
+    const response = await makeHttpRequest(
+      url,
+      {
+        method: 'POST',
+        headers: {
+          ...this._buildHeaders(),
+          'Content-Length': Buffer.byteLength(bodyStr),
+        },
+        body: bodyStr,
+      },
+      this._timeoutMs
+    );
+
+    return handleHttpResponse(response);
+  }
+
+  async searchProductsBySemanticQuery(query, options) {
+    const cleanQuery = validateSearchQuery(query);
+    const opts = options !== undefined ? options : {};
+
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new BuyWhereValidationError(
+        'options must be a plain object.',
+        'options'
+      );
+    }
+
+    const validatedOpts = validateSearchOptions(opts);
+
+    const payload = {
+      query: cleanQuery,
+      ...validatedOpts,
+    };
+
+    return this._post('/products/semantic-search', payload);
+  }
+
+  async getProductValueScore(productId) {
+    const cleanId = validateProductId(productId);
+    return this._get(`/products/${encodeURIComponent(cleanId)}/value-score`);
+  }
+
+  async getVendorPriceDistribution(productId) {
+    const cleanId = validateProductId(productId);
+    return this._get(`/products/${encodeURIComponent(cleanId)}/vendor-prices`);
+  }
+
+  async rankProductsByValueScore(productIds, options) {
+    if (productIds === null || productIds === undefined) {
+      throw new BuyWhereValidationError(
+        'productIds is required and must not be null or undefined.',
+        'productIds'
+      );
+    }
+    if (!Array.isArray(productIds)) {
+      throw new BuyWhereValidationError(
+        `productIds must be an array, received ${typeof productIds}.`,
+        'productIds'
+      );
+    }
+    if (productIds.length === 0) {
+      throw new BuyWhereValidationError(
+        'productIds must contain at least one product ID.',
+        'productIds'
+      );
+    }
+    if (productIds.length > 50) {
+      throw new BuyWhereValidationError(
+        'productIds must not contain more than 50 product IDs per request.',
+        'productIds'
+      );
+    }
+
+    const cleanIds = productIds.map((id, index) => {
+      if (id === null || id === undefined) {
+        throw new BuyWhereValidationError(
+          `productIds[${index}] must not be null or undefined.`,
+          'productIds'
+        );
+      }
+      if (typeof id !== 'string' && typeof id !== 'number') {
+        throw new BuyWhereValidationError(
+          `productIds[${index}] must be a string or number, received ${typeof id}.`,
+          'productIds'
+        );
+      }
+      const str = String(id).trim();
+      if (str.length === 0) {
+        throw new BuyWhereValidationError(
+          `productIds[${index}] must not be an empty string.`,
+          'productIds'
+        );
+      }
+      return str;
+    });
+
+    const opts = options !== undefined ? options : {};
+    if (typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new BuyWhereValidationError(
+        'options must be a plain object.',
+        'options'
+      );
+    }
+
+    const payload = {
+      product_ids: cleanIds,
+    };
+
+    if (opts.penalizeIntraSessionVariance !== undefined) {
+      if (typeof opts.penalizeIntraSessionVariance !== 'boolean') {
+        throw new BuyWhereValidationError(
+          'penalizeIntraSessionVariance must be a boolean.',
+          'penalizeIntraSessionVariance'
+        );
+      }
+      payload.penalize_intra_session_variance = opts.penalizeIntraSessionVariance;
+    }
+
+    if (opts.entropyWeight !== undefined) {
+      const v = Number(opts.entropyWeight);
+      if (isNaN(v) || v < 0 || v > 1) {
+        throw new BuyWhereValidationError(
+          'entropyWeight must be a number between 0.0 and 1.0.',
+          'entropyWeight'
+        );
+      }
+      payload.entropy_weight = v;
+    }
+
+    return this._post('/products/rank-by-value-score', payload);
+  }
+
+  async mainMethod(data) {
+    if (data === null || data === undefined) {
+      throw new BuyWhereValidationError(
+        'data is required. Pass an object with at least a "query" field for semantic search, ' +
+        'or a "productId" field for value-score lookup.',
+        'data'
+      );
+    }
+    if (typeof data !== 'object' || Array.isArray(data)) {
+      throw new BuyWhereValidationError(
+        `data must be a plain object, received ${Array.isArray(data) ? 'array' : typeof data}.`,
+        'data'
+      );
+    }
+
+    const hasQuery = data.query !== undefined && data.query !== null;
+    const hasProductId = data.productId !== undefined && data.productId !== null;
+    const hasProductIds = data.productIds !== undefined && data.productIds !== null;
+
+    if (!hasQuery && !hasProductId && !hasProductIds) {
+      throw new BuyWhereValidationError(
+        'data must contain at least one of: "query" (string for semantic search), ' +
+        '"productId" (string/number for value-score lookup), or ' +
+        '"productIds" (array for batch ranking).',
+        'data'
+      );
+    }
+
+    if (hasQuery) {
+      const { query, ...searchOptions } = data;
+      return this.searchProductsBySemanticQuery(query, searchOptions);
+    }
+
+    if (hasProductIds) {
+      const { productIds, ...rankOptions } = data;
+      return this.rankProductsByValueScore(productIds, rankOptions);
+    }
+
+    return this.getProductValueScore(data.productId);
+  }
+}
+
+function createBuyWhereClient(options) {
+  return new BuyWhereSingaporeClient(options || {});
+}
+
+const _defaultClientCache = { instance: null, key: null };
+
+function _getOrCreateDefaultClient() {
+  const currentKey = process.env.BUYWHERE_API_KEY;
+  if (!currentKey) {
+    throw new BuyWhereAuthError(
+      'No API key found. Set BUYWHERE_API_KEY environment variable or use createBuyWhereClient({ apiKey: "..." }).'
+    );
+  }
+  if (_defaultClientCache.instance === null || _defaultClientCache.key !== currentKey) {
+    _defaultClientCache.instance = new BuyWhereSingaporeClient({ apiKey: currentKey });
+    _defaultClientCache.key = currentKey;
+  }
+  return _defaultClientCache.instance;
+}
+
+const moduleExports = {
+  createBuyWhereClient,
+  BuyWhereSingaporeClient,
+  BuyWhereAuthError,
+  BuyWhereValidationError,
+  BuyWhereRateLimitError,
+  BuyWhereAPIError,
+
+  async mainMethod(data) {
+    return _getOrCreateDefaultClient().mainMethod(data);
+  },
+
+  async searchProductsBySemanticQuery(query, options) {
+    return _getOrCreateDefaultClient().searchProductsBySemanticQuery(query, options);
+  },
+
+  async getProductValueScore(productId) {
+    return _getOrCreateDefaultClient().getProductValueScore(productId);
+  },
+
+  async getVendorPriceDistribution(productId) {
+    return _getOrCreateDefaultClient().getVendorPriceDistribution(productId);
+  },
+
+  async rankProductsByValueScore(productIds, options) {
+    return _getOrCreateDefaultClient().rankProductsByValueScore(productIds, options);
+  },
+};
+
+module.exports = moduleExports;
 ```
