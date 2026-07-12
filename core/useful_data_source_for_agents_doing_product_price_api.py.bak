@@ -573,16 +573,11 @@ async def _nexus_mcp_shutdown():
 app.mount("/", _nexus_mcp_asgi_app)
 
 # --- NEXUS: reporte de uso real a Stripe (inyectado por forge_output_saver_v6) ---
-# --- HOTFIX: excluir paths de monitoreo/sistema del billing (ver Fase 0.5) ---
-_NEXUS_BILLING_EXCLUDED_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico"}
 @app.middleware("http")
 async def _nexus_usage_middleware(request, call_next):
     response = await call_next(request)
     try:
-        if (
-            request.url.path not in _NEXUS_BILLING_EXCLUDED_PATHS
-            and response.status_code < 400
-        ):
+        if response.status_code < 400:
             import os as _nexus_os
             import stripe as _nexus_stripe
             _customer_id = _nexus_os.environ.get("STRIPE_CUSTOMER_ID")
