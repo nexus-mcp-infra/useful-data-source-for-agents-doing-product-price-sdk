@@ -19,44 +19,6 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# --- NEXUS: x402 (pago por llamada en USDC, Base Sepolia testnet) ---
-from x402.http import FacilitatorConfig, HTTPFacilitatorClient, PaymentOption
-from x402.http.middleware.fastapi import PaymentMiddlewareASGI
-from x402.http.types import RouteConfig
-from x402.mechanisms.evm.exact import ExactEvmServerScheme
-from x402.schemas import Network
-from x402.server import x402ResourceServer
-
-_NEXUS_X402_EVM_ADDRESS = "0x70e9f8057bb50e31b6ee06958bcbbe7de9daa98f"
-_NEXUS_X402_NETWORK: Network = "eip155:84532"  # Base Sepolia (testnet) -- cambiar a eip155:8453 + facilitator mainnet para produccion
-_NEXUS_X402_PRICE = "$0.01"
-
-_nexus_x402_facilitator = HTTPFacilitatorClient(
-    FacilitatorConfig(url="https://x402.org/facilitator")
-)
-_nexus_x402_server = x402ResourceServer(_nexus_x402_facilitator)
-_nexus_x402_server.register(_NEXUS_X402_NETWORK, ExactEvmServerScheme())
-
-_NEXUS_X402_ROUTES: dict[str, RouteConfig] = {
-    "GET /search": RouteConfig(
-        accepts=[PaymentOption(scheme="exact", pay_to=_NEXUS_X402_EVM_ADDRESS, price=_NEXUS_X402_PRICE, network=_NEXUS_X402_NETWORK)],
-        mime_type="application/json",
-        description="Busqueda semantica de productos BuyWhere Singapore por value-score",
-    ),
-    "GET /product/{product_id}/value_breakdown": RouteConfig(
-        accepts=[PaymentOption(scheme="exact", pay_to=_NEXUS_X402_EVM_ADDRESS, price=_NEXUS_X402_PRICE, network=_NEXUS_X402_NETWORK)],
-        mime_type="application/json",
-        description="Desglose del value-score de un producto especifico",
-    ),
-    "GET /product/{product_id}/price_distribution": RouteConfig(
-        accepts=[PaymentOption(scheme="exact", pay_to=_NEXUS_X402_EVM_ADDRESS, price=_NEXUS_X402_PRICE, network=_NEXUS_X402_NETWORK)],
-        mime_type="application/json",
-        description="Distribucion de precios entre vendedores para un producto",
-    ),
-}
-
-app.add_middleware(PaymentMiddlewareASGI, routes=_NEXUS_X402_ROUTES, server=_nexus_x402_server)
-
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=True)
 VALID_API_KEYS = set(filter(None, os.environ.get("BUYWHERE_API_KEYS", "").split(",")))
 BUYWHERE_BASE_URL = os.environ.get("BUYWHERE_BASE_URL", "https://www.buywhere.com.sg")
@@ -612,18 +574,13 @@ app.mount("/", _nexus_mcp_asgi_app)
 
 # --- NEXUS: reporte de uso real a Stripe (inyectado por forge_output_saver_v6) ---
 # --- HOTFIX: excluir paths de monitoreo/sistema del billing (ver Fase 0.5) ---
-_NEXUS_BILLING_EXCLUDED_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico", "/search", "/product/{product_id}/value_breakdown", "/product/{product_id}/price_distribution"}  # x402 cubre estas 3 -- Stripe no debe cobrarlas de nuevo
+_NEXUS_BILLING_EXCLUDED_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico"}
 @app.middleware("http")
 async def _nexus_usage_middleware(request, call_next):
     response = await call_next(request)
     try:
-        # NOTA: usamos la plantilla de ruta (route.path), no request.url.path,
-        # porque hay endpoints con segmentos dinamicos (/product/{product_id}/...)
-        # -- comparar contra la URL ya resuelta nunca matchearia la exclusion.
-        _nexus_route = request.scope.get("route")
-        _nexus_path_key = getattr(_nexus_route, "path", None) or request.url.path
         if (
-            _nexus_path_key not in _NEXUS_BILLING_EXCLUDED_PATHS
+            request.url.path not in _NEXUS_BILLING_EXCLUDED_PATHS
             and response.status_code < 400
         ):
             import os as _nexus_os

@@ -6,3 +6,4 @@ pydantic
 scipy
 stripe
 uvicorn
+x402[fastapi,evm]
