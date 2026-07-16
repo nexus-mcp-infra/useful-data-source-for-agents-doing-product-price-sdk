@@ -37,18 +37,27 @@ _nexus_x402_facilitator = HTTPFacilitatorClient(
 _nexus_x402_server = x402ResourceServer(_nexus_x402_facilitator)
 _nexus_x402_server.register(_NEXUS_X402_NETWORK, ExactEvmServerScheme())
 
+# --- NEXUS PATCH x402_dynamic_route_matching_buywhere ---
+# x402HTTPServerBase._parse_route_pattern() (libreria x402 de terceros)
+# no reconoce la sintaxis "{param}" de FastAPI/Starlette para
+# segmentos dinamicos -- re.escape() la trata como texto literal, asi
+# que "{product_id}" en la clave NUNCA matchea un ID real (solo
+# matchearia el string literal "{product_id}" sin resolver). Se usa
+# la sintaxis ":param" que x402 SI convierte a "[^/]+" internamente.
+# La ruta real de FastAPI mas abajo sigue usando "{product_id}" -- esto
+# solo cambia la clave de config de x402, no toca routing de Starlette.
 _NEXUS_X402_ROUTES: dict[str, RouteConfig] = {
     "GET /search": RouteConfig(
         accepts=[PaymentOption(scheme="exact", pay_to=_NEXUS_X402_EVM_ADDRESS, price=_NEXUS_X402_PRICE, network=_NEXUS_X402_NETWORK)],
         mime_type="application/json",
         description="Busqueda semantica de productos BuyWhere Singapore por value-score",
     ),
-    "GET /product/{product_id}/value_breakdown": RouteConfig(
+    "GET /product/:product_id/value_breakdown": RouteConfig(
         accepts=[PaymentOption(scheme="exact", pay_to=_NEXUS_X402_EVM_ADDRESS, price=_NEXUS_X402_PRICE, network=_NEXUS_X402_NETWORK)],
         mime_type="application/json",
         description="Desglose del value-score de un producto especifico",
     ),
-    "GET /product/{product_id}/price_distribution": RouteConfig(
+    "GET /product/:product_id/price_distribution": RouteConfig(
         accepts=[PaymentOption(scheme="exact", pay_to=_NEXUS_X402_EVM_ADDRESS, price=_NEXUS_X402_PRICE, network=_NEXUS_X402_NETWORK)],
         mime_type="application/json",
         description="Distribucion de precios entre vendedores para un producto",
