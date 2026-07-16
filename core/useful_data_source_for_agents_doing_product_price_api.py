@@ -575,9 +575,21 @@ async def _nexus_mcp_call_core(method: str, path: str, params: dict) -> Any:
     Llama al endpoint real del core -- via ASGI in-process (sin red
     real, sin segundo proceso), no un HTTP call externo. `app` ya
     existe en este mismo modulo (es el FastAPI que FORGE genero).
+
+    --- NEXUS PATCH mcp_tool_grounding_buywhere ---
+    Las rutas reales estan protegidas con Security(_require_api_key)
+    (APIKeyHeader X-API-Key) -- sin mandar el header aca, esta misma
+    llamada in-process fallaba con 401 incluso despues de arreglar
+    el path. Se usa una key valida de BUYWHERE_API_KEYS, ya cargada
+    en este mismo proceso.
     """
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://nexus-internal") as client:
+    _internal_api_key = next(iter(VALID_API_KEYS), "")
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://nexus-internal",
+        headers={"X-API-Key": _internal_api_key},
+    ) as client:
         if method == "GET":
             resp = await client.get(path, params=params)
         else:
@@ -586,35 +598,24 @@ async def _nexus_mcp_call_core(method: str, path: str, params: dict) -> Any:
         return resp.json()
 
 
-@_nexus_mcp.tool(name='nexus_useful_data_source_for_agents_doing_prod_rank_buywhere_products_by_value_score', description="Searches the BuyWhere Singapore catalogue for products matching a natural-language query and returns them ranked by an auditable value-score derived from information-theoretic entropy of cross-vendor price variance. Use this when an agent needs to compare multiple products across vendors and justify a recommendation beyond lowest-price. Do NOT use for exact SKU or model-number lookups where identity matters more than value ranking, and do NOT use when the agent needs only a single vendor's listing.")
-async def rank_buywhere_products_by_value_score(query: Annotated[str, Field(..., description="Natural-language product description, e.g. 'noise-cancelling wireless headphones under SGD 300'. Must be in English.", min_length=3, max_length=300)], top_k: Annotated[float, Field(10, description='Maximum number of ranked products to return. Higher values increase latency. Recommended 5-20 for agent consumption.', ge=1, le=50)], max_price_sgd: Annotated[float, Field(None, description='Hard upper bound on product price in SGD. Products strictly above this value are excluded before ranking. Set to null to disable.', ge=0.01, le=99999.99)], category_filter: Annotated[str, Field(None, description="BuyWhere top-level category slug to restrict the search scope, e.g. 'electronics', 'home-appliances', 'health-beauty'. Leave null for cross-category search.", min_length=2, max_length=60)]) -> dict[str, Any]:
+# --- NEXUS PATCH mcp_tool_grounding_buywhere ---
+# Originally had 5 tools; 3 (resolve_buywhere_product_identity,
+# compare_buywhere_products_causal_rank, extract_buywhere_deal_anomalies)
+# called endpoints with no real implementation anywhere in this API and
+# were removed. The 2 remaining were remapped to their real GET
+# equivalents (method + path + params corrected to match what the core
+# actually implements).
+
+@_nexus_mcp.tool(name='nexus_useful_data_source_for_agents_doing_prod_rank_buywhere_products_by_value_score', description="Searches the BuyWhere Singapore catalogue for products matching a natural-language query and returns them ranked by an auditable value-score derived from Shannon entropy of cross-vendor price variance, causal reliability, and price rank. Use this when an agent needs ranked product recommendations for a Singapore market query with auditable justification per product. Do NOT use for real-time stock ticker data, non-SGD markets, or exact product ID lookup (use fetch_buywhere_vendor_price_distribution for that).")
+async def rank_buywhere_products_by_value_score(query: Annotated[str, Field(..., description="Natural-language product description, e.g. 'noise-cancelling wireless headphones under SGD 300'. Must be in English.", min_length=3, max_length=300)], limit: Annotated[float, Field(10, description='Maximum number of ranked products to return. Higher values increase latency. Recommended 5-20 for agent consumption.', ge=1, le=50)], min_value_score: Annotated[float, Field(0.0, description='Minimum composite value-score [0.0, 1.0] a product must have to be included. Products below this threshold are excluded before ranking.', ge=0.0, le=1.0)]) -> dict[str, Any]:
     """Rank BuyWhere Products by Value Score"""
-    params = {"query": query, "top_k": top_k, "max_price_sgd": max_price_sgd, "category_filter": category_filter}
-    return await _nexus_mcp_call_core('POST', '/buywhere/rank-by-value-score', params)
+    params = {"query": query, "limit": limit, "min_value_score": min_value_score}
+    return await _nexus_mcp_call_core('GET', '/search', params)
 
-@_nexus_mcp.tool(name='nexus_useful_data_source_for_agents_doing_prod_fetch_buywhere_vendor_price_distribution', description='Given a BuyWhere product identifier, returns the full cross-vendor price distribution in SGD along with the Shannon entropy of that distribution and a causal price-spread coefficient that quantifies whether price differences are driven by vendor margin or by product condition/variant. Use this when an agent already knows the product and needs to audit price fairness or detect outlier vendor pricing. Do NOT use as a discovery tool — it requires a known BuyWhere product_id. Do NOT use when only the cheapest vendor matters and no justification is needed.')
-async def fetch_buywhere_vendor_price_distribution(product_id: Annotated[str, Field(..., description='BuyWhere internal product identifier as returned by rank_buywhere_products_by_value_score or resolve_buywhere_product_identity. Format: alphanumeric string.', min_length=4, max_length=64)], include_out_of_stock: Annotated[bool, Field(False, description='If true, vendors with current stock_status=out_of_stock are included in the distribution for historical completeness. If false, only in-stock vendors are used. Default false to reflect actionable prices.')]) -> dict[str, Any]:
+@_nexus_mcp.tool(name='nexus_useful_data_source_for_agents_doing_prod_fetch_buywhere_vendor_price_distribution', description='Given a BuyWhere product identifier, returns the full cross-vendor price distribution in SGD along with the Shannon entropy of that distribution and the coefficient of variation. Use this when an agent already knows the product and needs to audit price fairness or detect outlier vendor pricing. Do NOT use as a discovery tool — it requires a known BuyWhere product_id from rank_buywhere_products_by_value_score.')
+async def fetch_buywhere_vendor_price_distribution(product_id: Annotated[str, Field(..., description='BuyWhere internal product identifier as returned by rank_buywhere_products_by_value_score. Format: alphanumeric string.', min_length=4, max_length=64)]) -> dict[str, Any]:
     """Fetch Vendor Price Distribution for SKU"""
-    params = {"product_id": product_id, "include_out_of_stock": include_out_of_stock}
-    return await _nexus_mcp_call_core('POST', '/buywhere/vendor-price-distribution', params)
-
-@_nexus_mcp.tool(name='nexus_useful_data_source_for_agents_doing_prod_resolve_buywhere_product_identity', description='Takes an ambiguous product name or partial model number and returns the canonical BuyWhere product_id with a semantic similarity score and disambiguation metadata. Use this before calling fetch_buywhere_vendor_price_distribution when the agent has a user-supplied name that may match multiple listings. Do NOT use when the agent already holds a validated product_id from a previous tool call — redundant resolution adds latency. Do NOT use for open-ended exploratory queries; use rank_buywhere_products_by_value_score instead.')
-async def resolve_buywhere_product_identity(raw_product_name: Annotated[str, Field(..., description="Partial or ambiguous product name, brand + model fragment, or user-typed string. E.g. 'Sony WH-1000' or 'dyson v11 vacuum'.", min_length=2, max_length=200)], candidate_limit: Annotated[float, Field(3, description='Number of candidate product identities to return when the match is ambiguous. The agent should surface these to the user if score < 0.90.', ge=1, le=10)]) -> dict[str, Any]:
-    """Resolve Product Identity from Partial Description"""
-    params = {"raw_product_name": raw_product_name, "candidate_limit": candidate_limit}
-    return await _nexus_mcp_call_core('POST', '/buywhere/resolve-product-identity', params)
-
-@_nexus_mcp.tool(name='nexus_useful_data_source_for_agents_doing_prod_compare_buywhere_products_causal_rank', description='Accepts a list of BuyWhere product_ids and returns a causal ranking that controls for confounders (brand premium, recency bias, vendor count asymmetry) using do-calculus-inspired adjustment on the value-score. Use this when an agent has a shortlist of 2-10 products and needs a defensible recommendation that is not contaminated by spurious correlations. Do NOT use with more than 10 products — use rank_buywhere_products_by_value_score for larger candidate sets. Do NOT use when the comparison must be within a single vendor.')
-async def compare_buywhere_products_causal_rank(product_ids: Annotated[list[str], Field(..., description='List of BuyWhere product identifiers to compare. Must contain between 2 and 10 items. Order does not affect output ranking.', min_length=2, max_length=10)], adjustment_covariates: Annotated[list[str], Field(None, description="Confounders to adjust for in the causal model. Accepted values: 'brand_premium', 'vendor_count_bias', 'recency_bias', 'condition_variant'. Defaults to all four if omitted.")]) -> dict[str, Any]:
-    """Causal Rank Comparison Across Product List"""
-    params = {"product_ids": product_ids, "adjustment_covariates": adjustment_covariates}
-    return await _nexus_mcp_call_core('POST', '/buywhere/causal-rank-comparison', params)
-
-@_nexus_mcp.tool(name='nexus_useful_data_source_for_agents_doing_prod_extract_buywhere_deal_anomalies', description='Scans a BuyWhere category or query result for listings whose price deviates significantly from the expected distribution (z-score threshold configurable) and flags them as anomalies — potential flash sales, data errors, or grey-market listings. Returns anomaly type classification and confidence. Use this when an agent is doing price-monitoring or deal-hunting on behalf of a user. Do NOT use as a general ranking tool — anomalies are not always good deals (errors and grey-market items are also flagged). Do NOT call on product_ids already confirmed as anomalies in the same session.')
-async def extract_buywhere_deal_anomalies(query_or_category: Annotated[str, Field(..., description='Either a natural-language product query or a BuyWhere category slug. The tool resolves which interpretation applies based on format.', min_length=2, max_length=200)], z_score_threshold: Annotated[float, Field(2.0, description='Minimum absolute z-score (relative to category price distribution) for a listing to be classified as anomalous. Lower values return more candidates with lower confidence; higher values return fewer with higher confidence. Typical useful range 1.5-3.0.', ge=0.5, le=4.0)], anomaly_types: Annotated[list[str], Field(None, description="Filter output to specific anomaly classifications. Accepted values: 'price_too_low', 'price_too_high', 'vendor_outlier', 'possible_data_error'. Defaults to all types if omitted.")]) -> dict[str, Any]:
-    """Extract Statistically Anomalous Deals"""
-    params = {"query_or_category": query_or_category, "z_score_threshold": z_score_threshold, "anomaly_types": anomaly_types}
-    return await _nexus_mcp_call_core('POST', '/buywhere/deal-anomaly-detection', params)
+    return await _nexus_mcp_call_core('GET', f'/product/{product_id}/price_distribution', {})
 
 
 # Crea el sub-app ASGI de streamable HTTP -- DEBE llamarse antes de
