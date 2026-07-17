@@ -711,3 +711,95 @@ async def _nexus_usage_middleware(request, call_next):
     except Exception:
         pass  # nunca romper la response real por un fallo de billing
     return response
+
+
+# --- NEXUS PATCH rate_limit_useful_data_source ---
+# Rate limiting por caller (Fase 1). Identidad resuelta con la mejor senal
+# disponible: wallet pagadora x402 (X-PAYMENT) > API key (X-API-Key,
+# hasheada) > IP del cliente. Corre como middleware ASGI, por lo tanto
+# cubre tanto las rutas REST como el sub-app FastMCP montado en "/" (ver
+# docstring de patch_rate_limit_useful_data_source.py para el detalle
+# completo de estas decisiones). Sin dependencias nuevas (solo stdlib).
+import base64 as _nexus_rl_base64
+import hashlib as _nexus_rl_hashlib
+import json as _nexus_rl_json
+import os as _nexus_rl_os
+import threading as _nexus_rl_threading
+import time as _nexus_rl_time
+from collections import OrderedDict as _NexusRLOrderedDict, deque as _nexus_rl_deque
+
+from fastapi import Request as _NexusRLRequest
+from fastapi.responses import JSONResponse as _NexusRLJSONResponse
+
+_NEXUS_RATE_LIMIT_MAX_REQUESTS = int(_nexus_rl_os.environ.get("NEXUS_RATE_LIMIT_PER_MINUTE", "60"))
+_NEXUS_RATE_LIMIT_WINDOW_SECONDS = float(_nexus_rl_os.environ.get("NEXUS_RATE_LIMIT_WINDOW_SECONDS", "60"))
+_NEXUS_RATE_LIMIT_MAX_TRACKED = int(_nexus_rl_os.environ.get("NEXUS_RATE_LIMIT_MAX_TRACKED", "10000"))
+_NEXUS_RATE_LIMIT_EXEMPT_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico"}
+
+_nexus_rate_limit_lock = _nexus_rl_threading.Lock()
+_nexus_rate_limit_state = _NexusRLOrderedDict()
+
+
+def _nexus_rate_limit_extract_wallet(payment_header):
+    try:
+        padded = payment_header + "=" * (-len(payment_header) % 4)
+        payload = _nexus_rl_json.loads(_nexus_rl_base64.b64decode(padded))
+        payer = payload.get("payload", {}).get("authorization", {}).get("from")
+        return payer.lower() if isinstance(payer, str) and payer else None
+    except Exception:
+        return None
+
+
+def _nexus_rate_limit_caller_id(request):
+    payment_header = request.headers.get("x-payment")
+    if payment_header:
+        wallet = _nexus_rate_limit_extract_wallet(payment_header)
+        if wallet:
+            return f"wallet:{wallet}"
+    api_key = request.headers.get("x-api-key")
+    if api_key:
+        digest = _nexus_rl_hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+        return f"apikey:{digest}"
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        client_ip = forwarded.split(",")[0].strip()
+    else:
+        client_ip = request.client.host if request.client else "unknown"
+    return f"ip:{client_ip}"
+
+
+def _nexus_rate_limit_check(caller_id):
+    now = _nexus_rl_time.monotonic()
+    window = _NEXUS_RATE_LIMIT_WINDOW_SECONDS
+    with _nexus_rate_limit_lock:
+        bucket = _nexus_rate_limit_state.get(caller_id)
+        if bucket is None:
+            if len(_nexus_rate_limit_state) >= _NEXUS_RATE_LIMIT_MAX_TRACKED:
+                _nexus_rate_limit_state.popitem(last=False)
+            bucket = _nexus_rl_deque()
+            _nexus_rate_limit_state[caller_id] = bucket
+        else:
+            _nexus_rate_limit_state.move_to_end(caller_id)
+        while bucket and now - bucket[0] > window:
+            bucket.popleft()
+        if len(bucket) >= _NEXUS_RATE_LIMIT_MAX_REQUESTS:
+            retry_after = max(1, int(window - (now - bucket[0])) + 1)
+            return False, retry_after
+        bucket.append(now)
+        return True, 0
+
+
+@app.middleware("http")
+async def _nexus_rate_limit_middleware(request: _NexusRLRequest, call_next):
+    if request.url.path in _NEXUS_RATE_LIMIT_EXEMPT_PATHS:
+        return await call_next(request)
+    caller_id = _nexus_rate_limit_caller_id(request)
+    allowed, retry_after = _nexus_rate_limit_check(caller_id)
+    if not allowed:
+        return _NexusRLJSONResponse(
+            status_code=429,
+            content={"error": "rate_limited", "detail": f"Too many requests. Retry after {retry_after}s."},
+            headers={"Retry-After": str(retry_after)},
+        )
+    return await call_next(request)
+# --- END NEXUS PATCH rate_limit_useful_data_source ---
