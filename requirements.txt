@@ -6,4 +6,4 @@ pydantic
 scipy
 stripe
 uvicorn
-x402[fastapi,evm]
+x402[evm,fastapi,mcp]==2.15.0
