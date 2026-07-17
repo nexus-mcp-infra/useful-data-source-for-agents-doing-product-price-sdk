@@ -579,52 +579,70 @@ _nexus_mcp = _NexusFastMCP(
 )
 
 
-async def _nexus_mcp_call_core(method: str, path: str, params: dict) -> Any:
-    """
-    Llama al endpoint real del core -- via ASGI in-process (sin red
-    real, sin segundo proceso), no un HTTP call externo. `app` ya
-    existe en este mismo modulo (es el FastAPI que FORGE genero).
+# --- NEXUS PATCH mcp_x402_auth_gate_buywhere ---
+# _nexus_mcp_call_core() eliminada: llamaba a las rutas HTTP reales via
+# ASGI in-process, pero esas mismas rutas estan protegidas por el
+# middleware x402 (ver "NEXUS: x402" mas arriba) -- cualquier request,
+# incluido este interno, exige un pago valido y devuelve 402 Payment
+# Required en vez de la respuesta real (confirmado en produccion:
+# logs/mcp_tool_grounding_2026-07-16/mcp_client_validation_result_2_post_x402_fix.json).
+# Los 2 tools MCP que sobreviven ahora llaman DIRECTO a sus funciones de
+# logica de negocio (search_singapore_products_by_value_score,
+# get_product_vendor_price_distribution), sin pasar por ASGI/HTTP/x402 --
+# mismo criterio que ya uso similarity-search-api (ver
+# patch_mcp_tool_grounding_similarity_search_inprocess.py) y que ya usa
+# la exclusion de billing de Stripe para tratar estas mismas rutas como
+# internas. Los 2 checks que la REST ya exige se aplican aca a mano, igual
+# que en similarity-search-api:
+#   - auth: _require_api_key() es una funcion comun, no FastAPI-DI-only --
+#     llamada directo con un `api_key` explicito del tool (parametro real
+#     de esta funcion es `api_key`, no `key` como en similarity-search-api;
+#     debe venir del llamador, no de VALID_API_KEYS del propio proceso).
+#   - pago: x402.mcp.create_payment_wrapper (integracion MCP oficial del
+#     SDK x402, ya instalado como dependencia de este asset) envuelve el
+#     handler con el mismo _nexus_x402_server/PaymentRequirements/precio
+#     que las rutas REST. Verifica antes del handler; liquida solo si el
+#     handler retorna sin excepcion.
 
-    --- NEXUS PATCH mcp_tool_grounding_buywhere ---
-    Las rutas reales estan protegidas con Security(_require_api_key)
-    (APIKeyHeader X-API-Key) -- sin mandar el header aca, esta misma
-    llamada in-process fallaba con 401 incluso despues de arreglar
-    el path. Se usa una key valida de BUYWHERE_API_KEYS, ya cargada
-    en este mismo proceso.
-    """
-    transport = httpx.ASGITransport(app=app)
-    _internal_api_key = next(iter(VALID_API_KEYS), "")
-    async with httpx.AsyncClient(
-        transport=transport,
-        base_url="http://nexus-internal",
-        headers={"X-API-Key": _internal_api_key},
-    ) as client:
-        if method == "GET":
-            resp = await client.get(path, params=params)
-        else:
-            resp = await client.post(path, json=params)
-        resp.raise_for_status()
-        return resp.json()
+from x402.mcp import create_payment_wrapper as _nexus_mcp_x402_wrapper_factory
+from x402.schemas.config import ResourceConfig as _NexusX402ResourceConfig
 
+# create_payment_wrapper() necesita PaymentRequirements (asset + amount ya
+# resueltos), no PaymentOption (price string sin resolver) -- son tipos
+# distintos en el SDK. Se reusa el mismo camino que ya usa la libreria
+# puertas adentro para las rutas REST (ver
+# x402.http.x402_http_server._build_payment_requirements_from_options):
+# ResourceConfig(misma price/network/pay_to que el PaymentOption de REST) ->
+# server.build_payment_requirements(). Requiere que el server este
+# inicializado (fetch de "supported" contra el facilitator); se garantiza
+# una sola vez sin duplicar la llamada si algo mas ya lo inicializo antes.
+if not getattr(_nexus_x402_server, "_initialized", False):
+    _nexus_x402_server.initialize()
 
-# --- NEXUS PATCH mcp_tool_grounding_buywhere ---
-# Originally had 5 tools; 3 (resolve_buywhere_product_identity,
-# compare_buywhere_products_causal_rank, extract_buywhere_deal_anomalies)
-# called endpoints with no real implementation anywhere in this API and
-# were removed. The 2 remaining were remapped to their real GET
-# equivalents (method + path + params corrected to match what the core
-# actually implements).
+_NEXUS_MCP_X402_RESOURCE_CONFIG = _NexusX402ResourceConfig(
+    scheme="exact",
+    pay_to=_NEXUS_X402_EVM_ADDRESS,
+    price=_NEXUS_X402_PRICE,
+    network=_NEXUS_X402_NETWORK,
+)
+_NEXUS_MCP_X402_ACCEPTS = _nexus_x402_server.build_payment_requirements(_NEXUS_MCP_X402_RESOURCE_CONFIG)
+_nexus_mcp_x402_wrapper = _nexus_mcp_x402_wrapper_factory(_nexus_x402_server, accepts=_NEXUS_MCP_X402_ACCEPTS)
 
-@_nexus_mcp.tool(name='nexus_useful_data_source_for_agents_doing_prod_rank_buywhere_products_by_value_score', description="Searches the BuyWhere Singapore catalogue for products matching a natural-language query and returns them ranked by an auditable value-score derived from Shannon entropy of cross-vendor price variance, causal reliability, and price rank. Use this when an agent needs ranked product recommendations for a Singapore market query with auditable justification per product. Do NOT use for real-time stock ticker data, non-SGD markets, or exact product ID lookup (use fetch_buywhere_vendor_price_distribution for that).")
-async def rank_buywhere_products_by_value_score(query: Annotated[str, Field(..., description="Natural-language product description, e.g. 'noise-cancelling wireless headphones under SGD 300'. Must be in English.", min_length=3, max_length=300)], limit: Annotated[float, Field(10, description='Maximum number of ranked products to return. Higher values increase latency. Recommended 5-20 for agent consumption.', ge=1, le=50)], min_value_score: Annotated[float, Field(0.0, description='Minimum composite value-score [0.0, 1.0] a product must have to be included. Products below this threshold are excluded before ranking.', ge=0.0, le=1.0)]) -> dict[str, Any]:
+@_nexus_mcp.tool(name='nexus_useful_data_source_for_agents_doing_prod_rank_buywhere_products_by_value_score', description="Searches the BuyWhere Singapore catalogue for products matching a natural-language query and returns them ranked by an auditable value-score derived from Shannon entropy of cross-vendor price variance, causal reliability, and price rank. Use this when an agent needs ranked product recommendations for a Singapore market query with auditable justification per product. Do NOT use for real-time stock ticker data, non-SGD markets, or exact product ID lookup (use fetch_buywhere_vendor_price_distribution for that). Requires a valid api_key (same as X-API-Key) and an x402 payment.")
+@_nexus_mcp_x402_wrapper
+async def rank_buywhere_products_by_value_score(query: Annotated[str, Field(..., description="Natural-language product description, e.g. 'noise-cancelling wireless headphones under SGD 300'. Must be in English.", min_length=3, max_length=300)], limit: Annotated[float, Field(10, description='Maximum number of ranked products to return. Higher values increase latency. Recommended 5-20 for agent consumption.', ge=1, le=50)], min_value_score: Annotated[float, Field(0.0, description='Minimum composite value-score [0.0, 1.0] a product must have to be included. Products below this threshold are excluded before ranking.', ge=0.0, le=1.0)], api_key: Annotated[str, Field(..., description='API key required for this paid operation -- same secret configured as X-API-Key on the REST endpoints (BUYWHERE_API_KEYS). Payment (x402) alone is not sufficient; both gates must pass.')]) -> dict[str, Any]:
     """Rank BuyWhere Products by Value Score"""
-    params = {"query": query, "limit": limit, "min_value_score": min_value_score}
-    return await _nexus_mcp_call_core('GET', '/search', params)
+    _require_api_key(api_key=api_key)
+    response = await search_singapore_products_by_value_score(query, int(limit), min_value_score, _api_key=next(iter(VALID_API_KEYS), ""))
+    return response.model_dump()
 
-@_nexus_mcp.tool(name='nexus_useful_data_source_for_agents_doing_prod_fetch_buywhere_vendor_price_distribution', description='Given a BuyWhere product identifier, returns the full cross-vendor price distribution in SGD along with the Shannon entropy of that distribution and the coefficient of variation. Use this when an agent already knows the product and needs to audit price fairness or detect outlier vendor pricing. Do NOT use as a discovery tool — it requires a known BuyWhere product_id from rank_buywhere_products_by_value_score.')
-async def fetch_buywhere_vendor_price_distribution(product_id: Annotated[str, Field(..., description='BuyWhere internal product identifier as returned by rank_buywhere_products_by_value_score. Format: alphanumeric string.', min_length=4, max_length=64)]) -> dict[str, Any]:
+@_nexus_mcp.tool(name='nexus_useful_data_source_for_agents_doing_prod_fetch_buywhere_vendor_price_distribution', description='Given a BuyWhere product identifier, returns the full cross-vendor price distribution in SGD along with the Shannon entropy of that distribution and the coefficient of variation. Use this when an agent already knows the product and needs to audit price fairness or detect outlier vendor pricing. Do NOT use as a discovery tool — it requires a known BuyWhere product_id from rank_buywhere_products_by_value_score. Requires a valid api_key (same as X-API-Key) and an x402 payment.')
+@_nexus_mcp_x402_wrapper
+async def fetch_buywhere_vendor_price_distribution(product_id: Annotated[str, Field(..., description='BuyWhere internal product identifier as returned by rank_buywhere_products_by_value_score. Format: alphanumeric string.', min_length=4, max_length=64)], api_key: Annotated[str, Field(..., description='API key required for this paid operation -- same secret configured as X-API-Key on the REST endpoints (BUYWHERE_API_KEYS). Payment (x402) alone is not sufficient; both gates must pass.')]) -> dict[str, Any]:
     """Fetch Vendor Price Distribution for SKU"""
-    return await _nexus_mcp_call_core('GET', f'/product/{product_id}/price_distribution', {})
+    _require_api_key(api_key=api_key)
+    response = await get_product_vendor_price_distribution(product_id, _api_key=next(iter(VALID_API_KEYS), ""))
+    return response.model_dump()
 
 
 # Crea el sub-app ASGI de streamable HTTP -- DEBE llamarse antes de
