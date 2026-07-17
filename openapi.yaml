@@ -1,0 +1,280 @@
+openapi: 3.1.0
+info:
+  title: BuyWhere Singapore Value Intelligence API
+  description: >-
+    Semantic product search over Singapore e-commerce with auditable
+    value-scores derived from Shannon entropy across vendor price
+    distributions. Generado del código fuente real deployado
+    (nexus-mcp-infra/useful-data-source-for-agents-doing-product-price-sdk,
+    core/useful_data_source_for_agents_doing_product_price_api.py, fetcheado
+    2026-07-17, commit 99850c2c1). Las 3 rutas core requieren pago x402 (USDC,
+    Base Sepolia testnet, $0.01/call) además de X-API-Key. Esta API también
+    expone un servidor MCP en /mcp con 2 tools equivalentes a /search y
+    /product/{id}/price_distribution — actualmente bloqueados en producción
+    por el mismo gate x402, sin wrapper de pago MCP instalado (ver AGENTS.md
+    sección MCP, no representable en OpenAPI).
+  version: "1.0.0"
+servers:
+  - url: https://useful-data-source-for-agents-production.up.railway.app
+security:
+  - ApiKeyAuth: []
+paths:
+  /search:
+    get:
+      summary: Semantic product search over BuyWhere Singapore catalog, ranked by value-score
+      description: >-
+        Use this when an agent needs ranked product recommendations for a
+        Singapore market query with auditable justification per product. Do
+        NOT use for real-time stock ticker data, non-SGD markets, or exact
+        product ID lookup (use /product/{product_id}/value_breakdown for that).
+      operationId: searchSingaporeProductsByValueScore
+      parameters:
+        - name: query
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 256
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 10
+            minimum: 1
+            maximum: 50
+        - name: min_value_score
+          in: query
+          required: false
+          schema:
+            type: number
+            default: 0.0
+            minimum: 0.0
+            maximum: 1.0
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductSearchResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '402':
+          $ref: '#/components/responses/PaymentRequired'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /product/{product_id}/value_breakdown:
+    get:
+      summary: Auditable decomposition of the value-score formula for a specific product
+      description: >-
+        Use this when an LLM agent needs to cite the mathematical
+        justification for a product recommendation. Do NOT use for bulk
+        catalog exploration (use /search for that).
+      operationId: getProductValueScoreBreakdown
+      parameters:
+        - name: product_id
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValueScoreBreakdownResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '402':
+          $ref: '#/components/responses/PaymentRequired'
+        '404':
+          $ref: '#/components/responses/ProductNotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /product/{product_id}/price_distribution:
+    get:
+      summary: Price-entropy analysis across vendors for a product
+      description: >-
+        Use this when an agent needs to determine whether a product's price
+        is stable across vendors (low entropy) or volatile/competitive (high
+        entropy) before making a recommendation. Do NOT use for value-score
+        ranking across multiple products (use /search for that).
+      operationId: getProductVendorPriceDistribution
+      parameters:
+        - name: product_id
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PriceDistributionResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '402':
+          $ref: '#/components/responses/PaymentRequired'
+        '404':
+          $ref: '#/components/responses/ProductNotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /health:
+    get:
+      summary: Liveness status and BuyWhere upstream reachability
+      description: >-
+        Use this for health checks, uptime monitors, deployment readiness
+        probes. Do NOT use this for product queries or value-score
+        computations.
+      operationId: checkApiAndUpstreamHealth
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: >-
+        Si BUYWHERE_API_KEYS no está configurada en el servidor, el request
+        pasa igual sin validar la key (modo abierto) — ver AGENTS.md.
+  responses:
+    Unauthorized:
+      description: API key inválida (solo aplica si el servidor tiene BUYWHERE_API_KEYS configurada)
+    PaymentRequired:
+      description: Falta pago x402 válido (USDC, Base Sepolia testnet) para esta ruta
+    ValidationError:
+      description: Validación de request fallida (query/product_id fuera de longitud, limit/min_value_score fuera de rango)
+    ProductNotFound:
+      description: product_id no encontrado en el catálogo BuyWhere
+  schemas:
+    VendorOffer:
+      type: object
+      properties:
+        vendor_name:
+          type: string
+        price_sgd:
+          type: number
+        listing_url:
+          type: string
+        in_stock:
+          type: boolean
+        intra_session_variance_proxy:
+          type: number
+        reliability_penalty:
+          type: number
+    RankedProduct:
+      type: object
+      properties:
+        product_id:
+          type: string
+        title:
+          type: string
+        category:
+          type: string
+        image_url:
+          type: [string, "null"]
+        vendor_offers:
+          type: array
+          items:
+            $ref: '#/components/schemas/VendorOffer'
+        price_min_sgd:
+          type: number
+        price_max_sgd:
+          type: number
+        price_mean_sgd:
+          type: number
+        shannon_entropy_bits:
+          type: number
+        causal_reliability_score:
+          type: number
+        value_score:
+          type: number
+        value_score_explanation:
+          type: string
+    ProductSearchResponse:
+      type: object
+      properties:
+        query:
+          type: string
+        result_count:
+          type: integer
+        currency:
+          type: string
+          example: SGD
+        products:
+          type: array
+          items:
+            $ref: '#/components/schemas/RankedProduct'
+        computation_ms:
+          type: number
+    ValueScoreBreakdownResponse:
+      type: object
+      properties:
+        product_id:
+          type: string
+        title:
+          type: string
+        shannon_entropy_bits:
+          type: number
+        max_possible_entropy_bits:
+          type: number
+        entropy_component:
+          type: number
+        reliability_component:
+          type: number
+        price_rank_component:
+          type: number
+        composite_value_score:
+          type: number
+        formula:
+          type: string
+        recommended_vendor:
+          type: string
+        recommended_price_sgd:
+          type: number
+    PriceDistributionResponse:
+      type: object
+      properties:
+        product_id:
+          type: string
+        title:
+          type: string
+        vendor_count:
+          type: integer
+        entropy_bits:
+          type: number
+        entropy_normalized:
+          type: number
+        price_spread_sgd:
+          type: number
+        coefficient_of_variation:
+          type: number
+        interpretation:
+          type: string
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        upstream_reachable:
+          type: boolean
+        api_version:
+          type: string
+        timestamp:
+          type: number
