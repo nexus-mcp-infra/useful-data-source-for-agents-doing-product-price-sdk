@@ -509,7 +509,8 @@ async def get_product_vendor_price_distribution(
     )
 
 
-@app.get("/health", response_model=HealthResponse, tags=["ops"])
+# --- NEXUS PATCH health_openapi_security_override ---
+@app.get("/health", response_model=HealthResponse, tags=["ops"], openapi_extra={"security": []})
 async def check_api_and_upstream_health():
     """
     Returns liveness status and whether BuyWhere upstream is reachable.
