@@ -66,6 +66,54 @@ _NEXUS_X402_ROUTES: dict[str, RouteConfig] = {
 
 app.add_middleware(PaymentMiddlewareASGI, routes=_NEXUS_X402_ROUTES, server=_nexus_x402_server)
 
+# --- NEXUS: x402scan discovery -- x-payment-info en openapi.json ---
+# x402scan (Merit-Systems) no tiene un .well-known/x402 ratificado --
+# confirmado 2026-07-26 cruzando x402-foundation/x402 (sin mencion),
+# x402scan-skills (deprecado, sin schema) y la spec vigente en
+# agentcash.dev/discovery (mismo equipo detras de x402scan): el
+# mecanismo real es leer /openapi.json buscando la extension
+# "x-payment-info" por operacion. Sin esto, x402scan reporta "no
+# discovery document found" pese a que /openapi.json ya se sirve.
+# Rutas declaradas explicitas con sintaxis FastAPI ("{product_id}"),
+# NO la sintaxis ":product_id" de _NEXUS_X402_ROUTES (son formatos
+# distintos -- ver docstring del patch). Precio sale de
+# _NEXUS_X402_PRICE ya definido arriba -- nada nuevo se inventa aca.
+_NEXUS_X402_OPENAPI_OPERATIONS = [
+    ("get", "/search"),
+    ("get", "/product/{product_id}/value_breakdown"),
+    ("get", "/product/{product_id}/price_distribution"),
+]
+
+
+def _nexus_x402_openapi_with_payment_info():
+    if app.openapi_schema:
+        return app.openapi_schema
+    from fastapi.openapi.utils import get_openapi as _nexus_get_openapi
+    schema = _nexus_get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    for _nexus_method, _nexus_path in _NEXUS_X402_OPENAPI_OPERATIONS:
+        _nexus_operation = schema.get("paths", {}).get(_nexus_path, {}).get(_nexus_method)
+        if _nexus_operation is None:
+            continue
+        _nexus_operation["x-payment-info"] = {
+            "price": {
+                "mode": "fixed",
+                "currency": "USD",
+                "amount": _NEXUS_X402_PRICE.lstrip("$"),
+            },
+            "protocols": [{"x402": {}}],
+        }
+        _nexus_operation.setdefault("responses", {})["402"] = {"description": "Payment Required"}
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+
+app.openapi = _nexus_x402_openapi_with_payment_info
+
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=True)
 VALID_API_KEYS = set(filter(None, os.environ.get("BUYWHERE_API_KEYS", "").split(",")))
 BUYWHERE_BASE_URL = os.environ.get("BUYWHERE_BASE_URL", "https://www.buywhere.com.sg")
@@ -667,6 +715,69 @@ async def _nexus_mcp_shutdown():
     await _nexus_mcp_stack.aclose()
 
 
+# --- NEXUS: A2A Agent Card (spec v0.3.0/v1.0) para discovery ---
+# Ruta correcta del spec vigente -- NO /agent.json (deprecado en
+# v0.1.0), NO /v1/agent-card.json ni /v2/agent-card.json. Debe
+# registrarse ANTES del app.mount("/", ...) de mas abajo: Starlette
+# matchea rutas en el orden en que se agregan a app.routes, y un Mount
+# en "/" intercepta cualquier path si se agrega primero.
+@app.get("/.well-known/agent-card.json", include_in_schema=False)
+async def _nexus_a2a_agent_card() -> dict:
+    return {
+        "name": "BuyWhere Singapore Value Intelligence API",
+        "description": "Semantic product search over Singapore e-commerce with auditable value-scores derived from Shannon entropy across vendor price distributions.",
+        "url": "https://useful-data-source-for-agents-production.up.railway.app",
+        "version": "1.0.0",
+        "documentationUrl": "https://useful-data-source-for-agents-production.up.railway.app/docs",
+        "provider": {
+            "organization": "nexus-mcp-infra",
+            "url": "https://github.com/nexus-mcp-infra/useful-data-source-for-agents-doing-product-price-sdk",
+        },
+        "capabilities": {
+            "streaming": False,
+            "pushNotifications": False,
+            "stateTransitionHistory": False,
+        },
+        "defaultInputModes": ["application/json"],
+        "defaultOutputModes": ["application/json"],
+        "additionalInterfaces": [
+            {"url": "https://useful-data-source-for-agents-production.up.railway.app/mcp", "transport": "MCP"},
+        ],
+        "securitySchemes": {
+            "apiKeyHeader": {"type": "apiKey", "in": "header", "name": "X-API-Key"},
+            "x402Payment": {
+                "type": "apiKey",
+                "in": "header",
+                "name": "X-PAYMENT",
+                "description": "x402 payment proof (USDC, Base Sepolia testnet) required on paid operations -- not a classic auth scheme.",
+            },
+        },
+        "security": [{"apiKeyHeader": [], "x402Payment": []}],
+        "skills": [
+            {
+                "id": "nexus_useful_data_source_for_agents_doing_prod_rank_buywhere_products_by_value_score",
+                "name": "Rank BuyWhere Products by Value Score",
+                "description": "Searches the BuyWhere Singapore catalogue for products matching a natural-language query and returns them ranked by an auditable value-score derived from Shannon entropy of cross-vendor price variance, causal reliability, and price rank. Do NOT use for real-time stock ticker data, non-SGD markets, or exact product ID lookup. Requires a valid api_key (same as X-API-Key) and an x402 payment.",
+                "tags": ["product-search", "price-comparison", "singapore-ecommerce"],
+            },
+            {
+                "id": "nexus_useful_data_source_for_agents_doing_prod_fetch_buywhere_vendor_price_distribution",
+                "name": "Fetch Vendor Price Distribution for SKU",
+                "description": "Given a BuyWhere product identifier, returns the full cross-vendor price distribution in SGD along with the Shannon entropy of that distribution and the coefficient of variation. Do NOT use as a discovery tool -- requires a known BuyWhere product_id from rank_buywhere_products_by_value_score. Requires a valid api_key (same as X-API-Key) and an x402 payment.",
+                "tags": ["price-distribution", "entropy"],
+            },
+        ],
+        "metadata": {
+            "protocol_note": (
+                "This service implements the Model Context Protocol (MCP) at /mcp, "
+                "not A2A's own JSONRPC/gRPC/HTTP+JSON task methods (message/send, "
+                "tasks/get, etc.). This Agent Card is provided for discovery/indexing "
+                "purposes; A2A-conformant task orchestration is not implemented."
+            ),
+        },
+    }
+
+
 app.mount("/", _nexus_mcp_asgi_app)
 
 # --- NEXUS: reporte de uso real a Stripe (inyectado por forge_output_saver_v6) ---
@@ -681,7 +792,7 @@ app.mount("/", _nexus_mcp_asgi_app)
 # (initialize, tools/list -- ninguno pasa por gate de auth/pago) se
 # facturaba igual que una operacion de negocio real. Confirmado en Railway:
 # STRIPE_CUSTOMER_ID/STRIPE_EVENT_NAME/STRIPE_SECRET_KEY reales, modo test.
-_NEXUS_BILLING_EXCLUDED_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico", "/mcp", "/search", "/product/{product_id}/value_breakdown", "/product/{product_id}/price_distribution"}  # x402 cubre estas 3 -- Stripe no debe cobrarlas de nuevo
+_NEXUS_BILLING_EXCLUDED_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico", "/mcp", "/search", "/product/{product_id}/value_breakdown", "/product/{product_id}/price_distribution", "/.well-known/agent-card.json"}  # x402 cubre estas 3 -- Stripe no debe cobrarlas de nuevo; agent-card.json es discovery, no negocio
 @app.middleware("http")
 async def _nexus_usage_middleware(request, call_next):
     response = await call_next(request)
@@ -735,7 +846,7 @@ from fastapi.responses import JSONResponse as _NexusRLJSONResponse
 _NEXUS_RATE_LIMIT_MAX_REQUESTS = int(_nexus_rl_os.environ.get("NEXUS_RATE_LIMIT_PER_MINUTE", "60"))
 _NEXUS_RATE_LIMIT_WINDOW_SECONDS = float(_nexus_rl_os.environ.get("NEXUS_RATE_LIMIT_WINDOW_SECONDS", "60"))
 _NEXUS_RATE_LIMIT_MAX_TRACKED = int(_nexus_rl_os.environ.get("NEXUS_RATE_LIMIT_MAX_TRACKED", "10000"))
-_NEXUS_RATE_LIMIT_EXEMPT_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico"}
+_NEXUS_RATE_LIMIT_EXEMPT_PATHS = {"/health", "/", "/docs", "/openapi.json", "/redoc", "/favicon.ico", "/.well-known/agent-card.json"}
 
 _nexus_rate_limit_lock = _nexus_rl_threading.Lock()
 _nexus_rate_limit_state = _NexusRLOrderedDict()
