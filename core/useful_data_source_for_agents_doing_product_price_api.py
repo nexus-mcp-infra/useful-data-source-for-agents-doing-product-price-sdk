@@ -17,6 +17,7 @@ app = FastAPI(
     title="BuyWhere Singapore Value Intelligence API",
     description="Semantic product search over Singapore e-commerce with auditable value-scores derived from Shannon entropy across vendor price distributions.",
     version="1.0.0",
+    contact={"email": "dasaanrod@gmail.com"},
 )
 
 # --- NEXUS: x402 (pago por llamada en USDC, Base Sepolia testnet) ---
@@ -94,6 +95,7 @@ def _nexus_x402_openapi_with_payment_info():
         version=app.version,
         description=app.description,
         routes=app.routes,
+        contact=app.contact,
     )
     for _nexus_method, _nexus_path in _NEXUS_X402_OPENAPI_OPERATIONS:
         _nexus_operation = schema.get("paths", {}).get(_nexus_path, {}).get(_nexus_method)
@@ -776,6 +778,26 @@ async def _nexus_a2a_agent_card() -> dict:
             ),
         },
     }
+
+
+# --- NEXUS: favicon.ico real para checklist de x402scan ---
+# x402scan.com/resources/register senala /favicon.ico ausente al leer
+# el listado (2026-07-26). Icono generico solido, sin decision de
+# branding -- generado con stdlib puro (struct+zlib), sin Pillow.
+# Debe registrarse ANTES del app.mount("/", ...) de mas abajo, mismo
+# motivo que el Agent Card: Starlette matchea rutas en el orden en que
+# se agregan a app.routes.
+import base64 as _nexus_favicon_base64
+
+_NEXUS_FAVICON_ICO = _nexus_favicon_base64.b64decode(
+    "AAABAAEAICAAAAEAIABpAAAAFgAAAIlQTkcNChoKAAAADUlIRFIAAAAgAAAAIAgGAAAAc3p69AAAADBJREFUeNrtziEBAAAIAzCS4MlA/1wQ42ZiftWzl1QCAgICAgICAgICAgICAgLpwAO9cwRbSHXMRQAAAABJRU5ErkJggg=="
+)
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def _nexus_favicon():
+    from fastapi import Response
+    return Response(content=_NEXUS_FAVICON_ICO, media_type="image/x-icon")
 
 
 app.mount("/", _nexus_mcp_asgi_app)
