@@ -433,8 +433,13 @@ async def search_singapore_products_by_value_score(
     query: str,
     limit: int = 10,
     min_value_score: float = 0.0,
-    _api_key: str = Depends(_require_api_key),
 ):
+    # _api_key/Depends(_require_api_key) removido a proposito: un asset
+    # retirado no deberia exigir una API key solo para enterarse de que
+    # esta retirado -- sin este cambio, un cliente real sin key recibia
+    # un generico 401 "Not authenticated" (FastAPI resuelve Depends()
+    # antes del cuerpo de la funcion) en vez del 410 explicito de abajo,
+    # confirmado en produccion antes de este fix.
     """
     Semantic product search over BuyWhere Singapore catalog, ranked by composite value-score
     (Shannon entropy + causal reliability + price rank). Returns structured output ready for
@@ -472,8 +477,9 @@ async def search_singapore_products_by_value_score(
 @app.get("/product/{product_id}/value_breakdown", response_model=ValueScoreBreakdownResponse, tags=["core"])
 async def get_product_value_score_breakdown(
     product_id: str,
-    _api_key: str = Depends(_require_api_key),
 ):
+    # ver comentario en search_singapore_products_by_value_score: mismo
+    # motivo para remover el gate de API key en un endpoint retirado.
     """
     Returns the full auditable decomposition of the value-score formula for a specific product:
     entropy component, reliability component, price rank component, and the recommended vendor.
@@ -526,8 +532,9 @@ async def get_product_value_score_breakdown(
 @app.get("/product/{product_id}/price_distribution", response_model=PriceDistributionResponse, tags=["core"])
 async def get_product_vendor_price_distribution(
     product_id: str,
-    _api_key: str = Depends(_require_api_key),
 ):
+    # ver comentario en search_singapore_products_by_value_score: mismo
+    # motivo para remover el gate de API key en un endpoint retirado.
     """
     Returns the full price-entropy analysis for a product: spread, coefficient of variation,
     Shannon entropy, and a human-readable interpretation for LLM reasoning chains.
