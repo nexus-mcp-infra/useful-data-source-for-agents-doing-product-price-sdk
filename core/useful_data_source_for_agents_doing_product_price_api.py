@@ -27,13 +27,27 @@ from x402.http.types import RouteConfig
 from x402.mechanisms.evm.exact import ExactEvmServerScheme
 from x402.schemas import Network
 from x402.server import x402ResourceServer
+# --- NEXUS PATCH cdp_facilitator_bazaar_buywhere ---
+from cdp.x402 import create_facilitator_config as _nexus_cdp_create_facilitator_config
+from x402.extensions.bazaar import (
+    OutputConfig as _NexusBazaarOutputConfig,
+    declare_discovery_extension as _nexus_declare_discovery_extension,
+)
 
 _NEXUS_X402_EVM_ADDRESS = "0x70e9f8057bb50e31b6ee06958bcbbe7de9daa98f"
 _NEXUS_X402_NETWORK: Network = "eip155:84532"  # Base Sepolia (testnet) -- cambiar a eip155:8453 + facilitator mainnet para produccion
 _NEXUS_X402_PRICE = "$0.01"
 
+# x402.org/facilitator es un facilitator de referencia -- nunca cataloga
+# nada en el Bazaar de Coinbase. El CDP Facilitator SI lo hace (indexa en
+# el primer verify/settle real que pasa por el, Base Sepolia incluido).
+# create_facilitator_config() sin argumentos lee CDP_API_KEY_ID /
+# CDP_API_KEY_SECRET del entorno (Railway) -- ver AGENTS.md del repo para
+# el detalle de setup. Sin esas env vars, cae a headers sin auth: list()
+# funciona igual (no requiere auth), pero verify/settle fallan con 401
+# real de CDP -- /search dejaria de poder cobrar hasta que se configuren.
 _nexus_x402_facilitator = HTTPFacilitatorClient(
-    FacilitatorConfig(url="https://x402.org/facilitator")
+    _nexus_cdp_create_facilitator_config()
 )
 _nexus_x402_server = x402ResourceServer(_nexus_x402_facilitator)
 _nexus_x402_server.register(_NEXUS_X402_NETWORK, ExactEvmServerScheme())
@@ -47,11 +61,29 @@ _nexus_x402_server.register(_NEXUS_X402_NETWORK, ExactEvmServerScheme())
 # la sintaxis ":param" que x402 SI convierte a "[^/]+" internamente.
 # La ruta real de FastAPI mas abajo sigue usando "{product_id}" -- esto
 # solo cambia la clave de config de x402, no toca routing de Starlette.
+_NEXUS_BAZAAR_SEARCH_EXTENSION = _nexus_declare_discovery_extension(
+    input={"query": "noise-cancelling wireless headphones under SGD 300", "limit": 10, "min_value_score": 0.0},
+    input_schema={
+        "properties": {
+            "query": {"type": "string", "description": "Natural-language product search query (English)"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+            "min_value_score": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        },
+        "required": ["query"],
+    },
+    output=_NexusBazaarOutputConfig(
+        example={"query": "wireless headphones", "result_count": 3, "currency": "SGD", "computation_ms": 42.1},
+    ),
+)
+
 _NEXUS_X402_ROUTES: dict[str, RouteConfig] = {
     "GET /search": RouteConfig(
         accepts=[PaymentOption(scheme="exact", pay_to=_NEXUS_X402_EVM_ADDRESS, price=_NEXUS_X402_PRICE, network=_NEXUS_X402_NETWORK)],
         mime_type="application/json",
         description="Busqueda semantica de productos BuyWhere Singapore por value-score",
+        service_name="BuyWhere-SG",
+        tags=["shopping", "singapore", "search", "value-score"],
+        extensions=_NEXUS_BAZAAR_SEARCH_EXTENSION,
     ),
     "GET /product/:product_id/value_breakdown": RouteConfig(
         accepts=[PaymentOption(scheme="exact", pay_to=_NEXUS_X402_EVM_ADDRESS, price=_NEXUS_X402_PRICE, network=_NEXUS_X402_NETWORK)],
