@@ -76,26 +76,17 @@ _NEXUS_BAZAAR_SEARCH_EXTENSION = _nexus_declare_discovery_extension(
     ),
 )
 
-_NEXUS_X402_ROUTES: dict[str, RouteConfig] = {
-    "GET /search": RouteConfig(
-        accepts=[PaymentOption(scheme="exact", pay_to=_NEXUS_X402_EVM_ADDRESS, price=_NEXUS_X402_PRICE, network=_NEXUS_X402_NETWORK)],
-        mime_type="application/json",
-        description="Busqueda semantica de productos BuyWhere Singapore por value-score",
-        service_name="BuyWhere-SG",
-        tags=["shopping", "singapore", "search", "value-score"],
-        extensions=_NEXUS_BAZAAR_SEARCH_EXTENSION,
-    ),
-    "GET /product/:product_id/value_breakdown": RouteConfig(
-        accepts=[PaymentOption(scheme="exact", pay_to=_NEXUS_X402_EVM_ADDRESS, price=_NEXUS_X402_PRICE, network=_NEXUS_X402_NETWORK)],
-        mime_type="application/json",
-        description="Desglose del value-score de un producto especifico",
-    ),
-    "GET /product/:product_id/price_distribution": RouteConfig(
-        accepts=[PaymentOption(scheme="exact", pay_to=_NEXUS_X402_EVM_ADDRESS, price=_NEXUS_X402_PRICE, network=_NEXUS_X402_NETWORK)],
-        mime_type="application/json",
-        description="Distribucion de precios entre vendedores para un producto",
-    ),
-}
+_NEXUS_DEPRECATION_MESSAGE = (
+    "This asset (BuyWhere Singapore Value Intelligence API) has been permanently retired, not temporarily down -- do not retry. Its only real data source, https://www.buywhere.com.sg, never existed as a reachable website: confirmed via the Wayback Machine (zero archived snapshots across 4 independent query methods) and SGNIC's official RDAP registry (domain not registered). See https://github.com/nexus-mcp-infra/useful-data-source-for-agents-doing-product-price-sdk (CLAUDE.md sections 9.8/9.10 in the source project) for the full investigation."
+)
+
+# --- NEXUS: BuyWhere deprecado 2026-07-27, ver CLAUDE.md 9.8/9.10 ---
+# _NEXUS_DEPRECATED_410 -- asset retirado, su unica fuente de datos
+# (www.buywhere.com.sg) nunca existio de verdad. Dict vacio: ninguna ruta
+# REST vuelve a disparar el challenge 402 -- no tiene sentido pedir pago
+# por un endpoint permanentemente muerto, aunque el settle nunca se
+# liquide sobre una respuesta de error.
+_NEXUS_X402_ROUTES: dict[str, RouteConfig] = {}
 
 app.add_middleware(PaymentMiddlewareASGI, routes=_NEXUS_X402_ROUTES, server=_nexus_x402_server)
 
@@ -455,6 +446,7 @@ async def search_singapore_products_by_value_score(
     Do NOT use this for: real-time stock ticker data, non-SGD markets, or exact product ID lookup
     (use /product/{product_id}/value_breakdown for that).
     """
+    raise HTTPException(status_code=410, detail=_NEXUS_DEPRECATION_MESSAGE)
     query = _validate_query(query)
     if not isinstance(limit, int) or not (1 <= limit <= 50):
         raise HTTPException(status_code=422, detail="limit must be an integer between 1 and 50.")
@@ -491,6 +483,7 @@ async def get_product_value_score_breakdown(
 
     Do NOT use this for: bulk catalog exploration (use /search for that).
     """
+    raise HTTPException(status_code=410, detail=_NEXUS_DEPRECATION_MESSAGE)
     product_id = _validate_product_id(product_id)
     raw = await _fetch_buywhere_product(product_id)
     if raw is None:
@@ -544,6 +537,7 @@ async def get_product_vendor_price_distribution(
 
     Do NOT use this for: value-score ranking across multiple products (use /search for that).
     """
+    raise HTTPException(status_code=410, detail=_NEXUS_DEPRECATION_MESSAGE)
     product_id = _validate_product_id(product_id)
     raw = await _fetch_buywhere_product(product_id)
     if raw is None:
@@ -662,70 +656,23 @@ _nexus_mcp = _NexusFastMCP(
 )
 
 
-# --- NEXUS PATCH mcp_x402_auth_gate_buywhere ---
-# _nexus_mcp_call_core() eliminada: llamaba a las rutas HTTP reales via
-# ASGI in-process, pero esas mismas rutas estan protegidas por el
-# middleware x402 (ver "NEXUS: x402" mas arriba) -- cualquier request,
-# incluido este interno, exige un pago valido y devuelve 402 Payment
-# Required en vez de la respuesta real (confirmado en produccion:
-# logs/mcp_tool_grounding_2026-07-16/mcp_client_validation_result_2_post_x402_fix.json).
-# Los 2 tools MCP que sobreviven ahora llaman DIRECTO a sus funciones de
-# logica de negocio (search_singapore_products_by_value_score,
-# get_product_vendor_price_distribution), sin pasar por ASGI/HTTP/x402 --
-# mismo criterio que ya uso similarity-search-api (ver
-# patch_mcp_tool_grounding_similarity_search_inprocess.py) y que ya usa
-# la exclusion de billing de Stripe para tratar estas mismas rutas como
-# internas. Los 2 checks que la REST ya exige se aplican aca a mano, igual
-# que en similarity-search-api:
-#   - auth: _require_api_key() es una funcion comun, no FastAPI-DI-only --
-#     llamada directo con un `api_key` explicito del tool (parametro real
-#     de esta funcion es `api_key`, no `key` como en similarity-search-api;
-#     debe venir del llamador, no de VALID_API_KEYS del propio proceso).
-#   - pago: x402.mcp.create_payment_wrapper (integracion MCP oficial del
-#     SDK x402, ya instalado como dependencia de este asset) envuelve el
-#     handler con el mismo _nexus_x402_server/PaymentRequirements/precio
-#     que las rutas REST. Verifica antes del handler; liquida solo si el
-#     handler retorna sin excepcion.
-
-from x402.mcp import create_payment_wrapper as _nexus_mcp_x402_wrapper_factory
-from x402.schemas.config import ResourceConfig as _NexusX402ResourceConfig
-
-# create_payment_wrapper() necesita PaymentRequirements (asset + amount ya
-# resueltos), no PaymentOption (price string sin resolver) -- son tipos
-# distintos en el SDK. Se reusa el mismo camino que ya usa la libreria
-# puertas adentro para las rutas REST (ver
-# x402.http.x402_http_server._build_payment_requirements_from_options):
-# ResourceConfig(misma price/network/pay_to que el PaymentOption de REST) ->
-# server.build_payment_requirements(). Requiere que el server este
-# inicializado (fetch de "supported" contra el facilitator); se garantiza
-# una sola vez sin duplicar la llamada si algo mas ya lo inicializo antes.
-if not getattr(_nexus_x402_server, "_initialized", False):
-    _nexus_x402_server.initialize()
-
-_NEXUS_MCP_X402_RESOURCE_CONFIG = _NexusX402ResourceConfig(
-    scheme="exact",
-    pay_to=_NEXUS_X402_EVM_ADDRESS,
-    price=_NEXUS_X402_PRICE,
-    network=_NEXUS_X402_NETWORK,
-)
-_NEXUS_MCP_X402_ACCEPTS = _nexus_x402_server.build_payment_requirements(_NEXUS_MCP_X402_RESOURCE_CONFIG)
-_nexus_mcp_x402_wrapper = _nexus_mcp_x402_wrapper_factory(_nexus_x402_server, accepts=_NEXUS_MCP_X402_ACCEPTS)
+# --- NEXUS: BuyWhere deprecado 2026-07-27, ver CLAUDE.md 9.8/9.10 ---
+# El wrapper de pago MCP (x402.mcp.create_payment_wrapper) se removio por
+# completo, junto con el fetch de "supported" que solo corria para
+# construirlo -- ya no la usa nadie (los 2 tools MCP de abajo levantan el
+# error de retiro directo, sin pasar por pago), y dejarla habria
+# significado que este servicio, ya permanentemente retirado, siguiera
+# dependiendo de credenciales CDP validas solo para poder arrancar.
 
 @_nexus_mcp.tool(name='nexus_useful_data_source_for_agents_doing_prod_rank_buywhere_products_by_value_score', description="Searches the BuyWhere Singapore catalogue for products matching a natural-language query and returns them ranked by an auditable value-score derived from Shannon entropy of cross-vendor price variance, causal reliability, and price rank. Use this when an agent needs ranked product recommendations for a Singapore market query with auditable justification per product. Do NOT use for real-time stock ticker data, non-SGD markets, or exact product ID lookup (use fetch_buywhere_vendor_price_distribution for that). Requires a valid api_key (same as X-API-Key) and an x402 payment.")
-@_nexus_mcp_x402_wrapper
 async def rank_buywhere_products_by_value_score(query: Annotated[str, Field(..., description="Natural-language product description, e.g. 'noise-cancelling wireless headphones under SGD 300'. Must be in English.", min_length=3, max_length=300)], limit: Annotated[float, Field(10, description='Maximum number of ranked products to return. Higher values increase latency. Recommended 5-20 for agent consumption.', ge=1, le=50)], min_value_score: Annotated[float, Field(0.0, description='Minimum composite value-score [0.0, 1.0] a product must have to be included. Products below this threshold are excluded before ranking.', ge=0.0, le=1.0)], api_key: Annotated[str, Field(..., description='API key required for this paid operation -- same secret configured as X-API-Key on the REST endpoints (BUYWHERE_API_KEYS). Payment (x402) alone is not sufficient; both gates must pass.')]) -> dict[str, Any]:
-    """Rank BuyWhere Products by Value Score"""
-    _require_api_key(api_key=api_key)
-    response = await search_singapore_products_by_value_score(query, int(limit), min_value_score, _api_key=next(iter(VALID_API_KEYS), ""))
-    return response.model_dump()
+    """Rank BuyWhere Products by Value Score -- RETIRED, see _NEXUS_DEPRECATION_MESSAGE"""
+    raise RuntimeError(_NEXUS_DEPRECATION_MESSAGE)
 
 @_nexus_mcp.tool(name='nexus_useful_data_source_for_agents_doing_prod_fetch_buywhere_vendor_price_distribution', description='Given a BuyWhere product identifier, returns the full cross-vendor price distribution in SGD along with the Shannon entropy of that distribution and the coefficient of variation. Use this when an agent already knows the product and needs to audit price fairness or detect outlier vendor pricing. Do NOT use as a discovery tool — it requires a known BuyWhere product_id from rank_buywhere_products_by_value_score. Requires a valid api_key (same as X-API-Key) and an x402 payment.')
-@_nexus_mcp_x402_wrapper
 async def fetch_buywhere_vendor_price_distribution(product_id: Annotated[str, Field(..., description='BuyWhere internal product identifier as returned by rank_buywhere_products_by_value_score. Format: alphanumeric string.', min_length=4, max_length=64)], api_key: Annotated[str, Field(..., description='API key required for this paid operation -- same secret configured as X-API-Key on the REST endpoints (BUYWHERE_API_KEYS). Payment (x402) alone is not sufficient; both gates must pass.')]) -> dict[str, Any]:
-    """Fetch Vendor Price Distribution for SKU"""
-    _require_api_key(api_key=api_key)
-    response = await get_product_vendor_price_distribution(product_id, _api_key=next(iter(VALID_API_KEYS), ""))
-    return response.model_dump()
+    """Fetch Vendor Price Distribution for SKU -- RETIRED, see _NEXUS_DEPRECATION_MESSAGE"""
+    raise RuntimeError(_NEXUS_DEPRECATION_MESSAGE)
 
 
 # Crea el sub-app ASGI de streamable HTTP -- DEBE llamarse antes de
